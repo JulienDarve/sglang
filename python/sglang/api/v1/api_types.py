@@ -4308,6 +4308,7 @@ class DeploymentInfo(msgspec.Struct, kw_only=True, frozen=True):
     hicache_host_total_tokens: Optional[int] = None
     kv_event_sources: List[KvEventSource] = []
     node_listeners: List[NodeRustListener] = []
+    grpc_kv_event_sources: List[KvEventSource] = []
 
     @classmethod
     def from_json_value(cls, value: Any) -> "DeploymentInfo":
@@ -4344,6 +4345,7 @@ class KvEventSource(msgspec.Struct, kw_only=True, frozen=True):
     endpoint: str = ""
     topic: str = ""
     block_size: int = 0
+    transport: str = ""
 
     @classmethod
     def from_json_value(cls, value: Any) -> "KvEventSource":
@@ -12201,6 +12203,8 @@ def decode_DeploymentInfo(value: Any) -> DeploymentInfo:
             kw["kv_event_sources"] = [] if x is None else [decode_KvEventSource(e) for e in _expect_seq(x, expected="a sequence")]
         elif key == "node_listeners":
             kw["node_listeners"] = [] if x is None else [decode_NodeRustListener(e) for e in _expect_seq(x, expected="a sequence")]
+        elif key == "grpc_kv_event_sources":
+            kw["grpc_kv_event_sources"] = [] if x is None else [decode_KvEventSource(e) for e in _expect_seq(x, expected="a sequence")]
     return DeploymentInfo(**kw)
 
 
@@ -12237,6 +12241,8 @@ def encode_DeploymentInfo(v: DeploymentInfo) -> Dict[str, Any]:
         d["kv_event_sources"] = [encode_KvEventSource(e) for e in v.kv_event_sources]
     if v.node_listeners:
         d["node_listeners"] = [encode_NodeRustListener(e) for e in v.node_listeners]
+    if v.grpc_kv_event_sources:
+        d["grpc_kv_event_sources"] = [encode_KvEventSource(e) for e in v.grpc_kv_event_sources]
     return d
 
 
@@ -12277,6 +12283,8 @@ def decode_KvEventSource(value: Any) -> KvEventSource:
             kw["topic"] = _expect_str(x, expected="a string")
         elif key == "block_size":
             kw["block_size"] = _expect_uint(x, expected="u32")
+        elif key == "transport":
+            kw["transport"] = _expect_str(x, expected="a string")
     return KvEventSource(**kw)
 
 
@@ -12286,4 +12294,5 @@ def encode_KvEventSource(v: KvEventSource) -> Dict[str, Any]:
     d["endpoint"] = v.endpoint
     d["topic"] = v.topic
     d["block_size"] = v.block_size
+    d["transport"] = v.transport
     return d

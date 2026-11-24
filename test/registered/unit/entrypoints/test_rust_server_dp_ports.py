@@ -52,7 +52,8 @@ def _scheduler_for_typed_config(load_snapshot_writer=None):
         kv_events_publisher=SimpleNamespace(
             local_kv_event_sources=MagicMock(
                 return_value=[{"endpoint": "tcp://127.0.0.1:5557"}]
-            )
+            ),
+            local_kv_event_relay=MagicMock(return_value=None),
         ),
         page_size=16,
         tree_cache=None,
@@ -218,6 +219,33 @@ def test_deployment_info_reports_listener_dp_rank(server_args, ranks, expected):
         extension.ServerArgs.call_args.kwargs["deployment_info"]
     )
     assert deployment_info["dp_rank"] == expected
+
+
+@pytest.mark.parametrize(
+    "relay",
+    [None, {"dp_rank": 3, "endpoint": "ipc:///kv/events", "replay_endpoint": "x"}],
+    ids=["kv-events-off", "relayed"],
+)
+def test_grpc_kv_event_source_is_advertised_only_with_a_relay(relay):
+    """With KV events off, a listener reports no gRPC stream; with them on, it
+    reports its rank's stream on its own gRPC port and passes on the relay's
+    private sockets."""
+    scheduler = _scheduler_for_typed_config()
+    scheduler.kv_events_publisher.local_kv_event_relay.return_value = relay
+    extension = MagicMock()
+    with (
+        get_context().override_server_args(grpc_port=50051),
+        get_parallel().override(attn_dp_rank=0, dp_rank=None),
+        patch.object(rust_config, "compute_num_reserved_tokens", return_value=0),
+        patch.object(rust_config, "_launch_server_info", return_value="{}"),
+    ):
+        rust_config._build_server_args(scheduler, extension=extension)
+    deployment_info = json.loads(
+        extension.ServerArgs.call_args.kwargs["deployment_info"]
+    )
+    assert deployment_info["kv_event_relay"] == relay
+    expected = [dict(dp_rank=3, endpoint="", topic="", block_size=16)]
+    assert deployment_info["grpc_kv_event_sources"] == (expected if relay else [])
 
 
 @pytest.mark.parametrize("enable_metrics", [False, True])

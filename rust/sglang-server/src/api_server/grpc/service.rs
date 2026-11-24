@@ -2266,6 +2266,66 @@ mod tests {
         assert_eq!(info.num_reserved_tokens, 4);
     }
 
+    /// Sidecars pick a KV event source by its transport.
+    #[tokio::test]
+    async fn server_info_labels_kv_event_sources_with_their_transport() {
+        use crate::message::config::{DeploymentInfo, KvEventSource};
+
+        let source = |endpoint: &str| KvEventSource {
+            dp_rank: 1,
+            endpoint: endpoint.into(),
+            topic: String::new(),
+            block_size: 16,
+        };
+        let Harness {
+            service,
+            intake_rx,
+            abort_rx: _,
+        } = Harness::build(
+            1,
+            false,
+            Duration::from_secs(1),
+            true,
+            None,
+            ServerArgs {
+                deployment_info: DeploymentInfo {
+                    kv_event_sources: vec![source("tcp://127.0.0.1:5558")],
+                    grpc_kv_event_sources: vec![source("")],
+                    ..Default::default()
+                },
+                ..test_server_args()
+            },
+        );
+        let call = service.get_server_info(Request::new(api::GetServerInfoRequest {}));
+        let scheduler = async {
+            let TmEvent::Intake {
+                request: control,
+                admission,
+            } = intake_rx.recv_async().await.unwrap()
+            else {
+                panic!("server info must submit one control request");
+            };
+            assert!(admission.try_accept());
+            let envelope = rmpv::Value::Map(vec![(
+                rmpv::Value::from("internal_state"),
+                rmpv::Value::Map(Vec::new()),
+            )]);
+            let mut payload = Vec::new();
+            rmpv::encode::write_value(&mut payload, &envelope).unwrap();
+            control
+                .sink
+                .try_send(ResponseItem::Control(bytes::Bytes::from(payload)))
+                .unwrap();
+        };
+        let (response, ()) = tokio::join!(call, scheduler);
+        let deployment = response.unwrap().into_inner().deployment_info.unwrap();
+        let transports = |sources: &[api::KvEventSource]| {
+            Vec::from_iter(sources.iter().map(|source| source.transport.clone()))
+        };
+        assert_eq!(transports(&deployment.kv_event_sources), ["zmq"]);
+        assert_eq!(transports(&deployment.grpc_kv_event_sources), ["grpc"]);
+    }
+
     /// gRPC `GetServerInfo` advertises the same nonempty owning-runtime id on
     /// repeated calls against the same core-backed adapter.
     #[tokio::test]

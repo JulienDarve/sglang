@@ -91,6 +91,10 @@ def _build_server_args(
         "prefill": ext.DisaggregationMode.Prefill,
         "decode": ext.DisaggregationMode.Decode,
     }[get_disagg().disaggregation_mode]
+    kv_event_block_size = scheduler.page_size * get_parallel().dcp_size
+    kv_event_relay = scheduler.kv_events_publisher.local_kv_event_relay(
+        kv_event_block_size
+    )
     deployment_info = {
         "disaggregation_bootstrap_port": get_disagg().disaggregation_bootstrap_port,
         "node_rank": get_parallel().node_rank,
@@ -126,7 +130,22 @@ def _build_server_args(
         # initialized KV publisher directly instead of calling get_init_info()
         # on a partially initialized scheduler.
         "kv_event_sources": scheduler.kv_events_publisher.local_kv_event_sources(
-            scheduler.page_size * get_parallel().dcp_size
+            kv_event_block_size
+        ),
+        # Private to this process; the listener never reports it.
+        "kv_event_relay": kv_event_relay,
+        # The relayed stream, on this listener's gRPC port: no endpoint.
+        "grpc_kv_event_sources": (
+            []
+            if kv_event_relay is None
+            else [
+                {
+                    "dp_rank": kv_event_relay["dp_rank"],
+                    "endpoint": "",
+                    "topic": "",
+                    "block_size": kv_event_block_size,
+                }
+            ]
         ),
         # Every Rust listener of the deployment (`RustServer.gather_server_endpoints`).
         "rust_server_endpoints": scheduler.rust_server_endpoints,

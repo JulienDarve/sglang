@@ -5,9 +5,13 @@
 //! mounts the `api.v1` adapter on the transport-neutral
 //! [`crate::api_server::handlers::CoreHandle`] contract.
 
+use std::sync::Arc;
+
 use sglang_api_types::api::v1::sglang_service_server::SglangServiceServer;
+use sglang_kv_types::kv::v1::kv_events_server::KvEventsServer;
 use tokio_stream::wrappers::TcpListenerStream;
 
+use super::kv_events::{KvEventRelay, KvEventsService};
 use super::service::GrpcService;
 use crate::api_server::handlers::CoreHandle;
 
@@ -52,6 +56,7 @@ fn max_message_size() -> usize {
 pub(crate) async fn serve(
     listener: std::net::TcpListener,
     service: GrpcService,
+    kv_event_relay: Option<Arc<KvEventRelay>>,
     core: CoreHandle,
     shutdown: flume::Receiver<()>,
 ) {
@@ -68,12 +73,19 @@ pub(crate) async fn serve(
     let service = SglangServiceServer::new(service)
         .max_decoding_message_size(max_message_size)
         .max_encoding_message_size(max_message_size);
+    let (stop_kv_events, kv_events_stopped) = tokio::sync::watch::channel(false);
+    let kv_events = KvEventsServer::new(KvEventsService::new(kv_event_relay, kv_events_stopped))
+        .max_decoding_message_size(max_message_size)
+        .max_encoding_message_size(max_message_size);
     let serve = tonic::transport::Server::builder()
         .add_service(service)
+        .add_service(kv_events)
         .serve_with_incoming_shutdown(incoming, {
             let core = core.clone();
             async move {
                 core.drain_ended().await;
+                // KV event streams never end by themselves.
+                let _ = stop_kv_events.send(true);
             }
         });
 

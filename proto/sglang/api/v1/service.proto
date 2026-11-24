@@ -311,6 +311,11 @@ message DeploymentInfo {
   // Every Rust listener this launch runs on this node, in port-offset order.
   // Each of them reports the same list, so one connection finds the rest.
   repeated NodeRustListener node_listeners = 20;
+
+  // This listener's `sglang.kv.v1.KvEvents` streams (transport "grpc", empty
+  // endpoint: this server). Kept apart from kv_event_sources, where clients
+  // reject a second source for one rank.
+  repeated KvEventSource grpc_kv_event_sources = 21;
 }
 
 // One Rust listener: the HTTP (and native gRPC) server embedded by a DP-group
@@ -330,4 +335,6 @@ message KvEventSource {
   string endpoint = 2;
   string topic = 3;
   uint32 block_size = 4;
+  // "zmq" or "grpc"; empty from servers that predate this field means "zmq".
+  string transport = 5;
 }

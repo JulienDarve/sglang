@@ -84,6 +84,10 @@ tokio-stream = { workspace = true }
 # (`SGLANG_ENABLE_REQUEST_DECOMPRESSION`).
 zstd = { version = "0.13", default-features = false }
 sglang_api_types = { package = "sglang-api-types", path = "../sglang-api-types" }
+sglang_kv_types = { package = "sglang-kv-types", path = "../sglang-kv-types" }
+# The KV event relay's SUB and DEALER sockets to the scheduler's publisher,
+# which binds them on private ipc:// addresses.
+zeromq = { version = "0.7", default-features = false, features = ["tokio-runtime", "ipc-transport"] }
 
 # Hardware SHA-256 extensions; identical digests. sha2 0.10 compiles its
 # aarch64 backend only with `asm` (x86 already uses SHA-NI without it).
