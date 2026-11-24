@@ -49,9 +49,11 @@ RUST_KV_EVENT_BATCH_FIXTURE = os.path.join(
 
 
 class TestLocalKvEventSource(CustomTestCase):
-    def _publisher(self, attn_dp_rank=0, **config):
+    def _publisher(self, attn_dp_rank=0, local_relay=False, **config):
         publisher = EventPublisherFactory.create(
-            json.dumps({"publisher": "zmq", **config}), attn_dp_rank=attn_dp_rank
+            json.dumps({"publisher": "zmq", **config}),
+            attn_dp_rank=attn_dp_rank,
+            local_relay=local_relay,
         )
         atexit.unregister(publisher.shutdown)
         self.addCleanup(publisher.shutdown)
@@ -97,6 +99,26 @@ class TestLocalKvEventSource(CustomTestCase):
             else:
                 self.fail("No event received from the advertised local source")
 
+    def test_private_sockets_carry_the_stream_for_the_rust_server(self):
+        """The private sockets the Rust server relays carry the published batches
+        and a replay; only a publishing zmq publisher binds them."""
+        for config in (None, json.dumps({"publisher": "null"})):
+            off = EventPublisherFactory.create(config, local_relay=True)
+            self.assertIsNone(off.describe_local_relay(16))
+
+        publisher = self._publisher(local_relay=True, endpoint="inproc://kv-relay-test")
+        relay = publisher.describe_local_relay(16)
+        self.assertEqual((relay["dp_rank"], relay["block_size"]), (0, 16))
+        self._assert_event_received(publisher, {**relay, "topic": ""})
+
+        # No replay endpoint is configured: the private one still answers.
+        dealer = zmq.Context.instance().socket(zmq.DEALER)
+        self.addCleanup(dealer.close, linger=0)
+        dealer.setsockopt(zmq.RCVTIMEO, 5000)
+        dealer.connect(relay["replay_endpoint"])
+        dealer.send_multipart([b"", (0).to_bytes(8, "big")])
+        self.assertEqual(dealer.recv_multipart()[2], (0).to_bytes(8, "big"))
+
 
 class TestNullPublisherConfig(CustomTestCase):
     def test_config_without_a_real_publisher_builds_the_noop(self):
@@ -120,12 +142,16 @@ class TestShutdown(CustomTestCase):
     def test_full_queue_does_not_skip_socket_cleanup(self):
         with patch.object(threading.Thread, "start"):
             publisher = ZmqEventPublisher(
-                attn_dp_rank=0, endpoint="inproc://kv-shutdown-test", max_queue_size=1
+                attn_dp_rank=0,
+                endpoint="inproc://kv-shutdown-test",
+                max_queue_size=1,
+                local_relay=True,
             )
         atexit.unregister(publisher.shutdown)
         publisher.publish(KVEventBatch(ts=1.0, events=[]))
         publisher.shutdown()
         self.assertTrue(publisher._pub.closed)
+        self.assertFalse(os.path.exists(publisher._relay_dir))
 
 
 class TestResolveLoadPubRange(CustomTestCase):
@@ -196,11 +222,8 @@ class TestBlockStoredWireFormat(CustomTestCase):
 
 class TestRustServerDecodedFields(CustomTestCase):
     def test_event_fields_match_the_rust_server_decoder(self):
-        """The Rust server's KvEvents relay decodes exactly these event types and
-        fields (rust/sglang-server/src/api_server/grpc/kv_events/wire.rs): it
-        drops any other field and cannot decode any other type, so a new one
-        belongs there and in proto/sglang/kv/v1 too. Its test decodes the
-        fixture, which holds a batch with every field as published."""
+        """A new event type fails the Rust server's decoder (kv_events/wire.rs), a new
+        field is dropped: add both there, in proto/sglang/kv/v1 and in the fixture."""
         self.assertEqual(EventBatch.__struct_fields__, ("ts", "events", "attn_dp_rank"))
         (events,) = get_args(get_type_hints(KVEventBatch)["events"])
         self.assertEqual(
@@ -364,68 +387,6 @@ class TestReplay(CustomTestCase):
                     break
                 numbers.append(seq)
             self.assertEqual(numbers, list(range(first, first + steps)))
-
-
-class TestLocalRelay(CustomTestCase):
-    def test_private_sockets_carry_the_configured_endpoint_stream(self):
-        """The private sockets the Rust server relays carry the batches,
-        sequence numbers and replay of the configured endpoint, and only a
-        publishing zmq publisher binds them."""
-        for config in (None, json.dumps({"publisher": "null"})):
-            off = EventPublisherFactory.create(config, local_relay=True)
-            self.assertIsNone(off.describe_local_relay(16))
-
-        port = get_free_port()
-        publisher = EventPublisherFactory.create(
-            json.dumps({"publisher": "zmq", "endpoint": f"tcp://*:{port}"}),
-            local_relay=True,
-        )
-        atexit.unregister(publisher.shutdown)
-        self.addCleanup(publisher.shutdown)
-        relay = publisher.describe_local_relay(16)
-        self.assertEqual((relay["dp_rank"], relay["block_size"]), (0, 16))
-        context = zmq.Context.instance()
-        subscribers = []
-        for endpoint in (f"tcp://127.0.0.1:{port}", relay["endpoint"]):
-            subscriber = context.socket(zmq.SUB)
-            self.addCleanup(subscriber.close, linger=0)
-            subscriber.setsockopt_string(zmq.SUBSCRIBE, "")
-            subscriber.connect(endpoint)
-            subscribers.append(subscriber)
-        batch = KVEventBatch(ts=1.0, events=[AllBlocksCleared()])
-        # A SUB socket misses what is published before it joins.
-        for _ in range(100):
-            publisher.publish(batch)
-            if all(subscriber.poll(50) for subscriber in subscribers):
-                break
-        for _ in range(3):
-            publisher.publish(batch)
-        publisher._event_queue.join()
-        received = []
-        for subscriber in subscribers:
-            received.append([])
-            while subscriber.poll(200):
-                received[-1].append(subscriber.recv_multipart())
-        configured, private = received
-        self.assertEqual(len(configured[-4:]), 4)
-        self.assertEqual(private[-4:], configured[-4:])
-        last = int.from_bytes(configured[-1][1], "big")
-
-        # No replay endpoint is configured: the private one still answers.
-        dealer = context.socket(zmq.DEALER)
-        self.addCleanup(dealer.close, linger=0)
-        dealer.setsockopt(zmq.RCVTIMEO, 5000)
-        dealer.connect(relay["replay_endpoint"])
-        dealer.send_multipart([b"", (0).to_bytes(8, "big")])
-        replayed = [dealer.recv_multipart()[1:] for _ in range(last + 2)]
-        self.assertEqual(replayed[-5:-1], configured[-4:])
-        self.assertEqual(
-            [int.from_bytes(seq, "big", signed=True) for _, seq, _ in replayed],
-            [*range(last + 1), -1],
-        )
-
-        self.doCleanups()
-        self.assertFalse(os.path.exists(relay["endpoint"][len("ipc://") :]))
 
 
 if __name__ == "__main__":

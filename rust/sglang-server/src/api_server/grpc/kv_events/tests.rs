@@ -99,7 +99,7 @@ async fn serve_replays(mut socket: RouterSocket, buffer: Arc<Mutex<BTreeMap<u64,
     }
 }
 
-/// The service over a relay of `publisher`; streams end when the sender drops.
+/// The service over a relay of `publisher`, and the sender that stops its streams.
 fn service(publisher: &Publisher) -> (KvEventsService, watch::Sender<bool>) {
     let (stop, stopped) = watch::channel(false);
     let relay = KvEventRelay::start(&publisher.config);
@@ -250,7 +250,7 @@ async fn resume_replays_the_buffer_then_continues_live() {
     // Published before anyone subscribed.
     let (payload, every_field) = batch_with_every_field();
     publisher.buffer(0, payload);
-    let (service, _stop) = service(&publisher);
+    let (service, stop) = service(&publisher);
 
     // Without a cursor, the stream starts live.
     let (stream_id, mut live) = subscribe(&service, None).await.unwrap();
@@ -275,6 +275,11 @@ async fn resume_replays_the_buffer_then_continues_live() {
     assert_refused(&service, ("", 0), tonic::Code::OutOfRange).await;
     publisher.forget_before(u64::MAX);
     assert_refused(&service, ("", 2), tonic::Code::OutOfRange).await;
+
+    // A shutdown ends the open streams, which it would otherwise wait for.
+    stop.send(true).unwrap();
+    let status = next_batch(&mut live).await.unwrap_err();
+    assert_eq!(status.code(), tonic::Code::Unavailable, "{status}");
 }
 
 #[tokio::test]

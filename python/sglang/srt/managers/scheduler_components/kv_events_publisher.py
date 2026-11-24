@@ -19,9 +19,8 @@ from sglang.srt.disaggregation.kv_events import (
     is_kv_publisher_rank,
     select_kv_publisher_dp_rank,
 )
-from sglang.srt.environ import envs
 from sglang.srt.managers.io_struct import hook_custom_types, sock_send
-from sglang.srt.runtime_context import get_parallel, get_serving
+from sglang.srt.runtime_context import get_parallel
 
 logger = logging.getLogger(__name__)
 
@@ -51,6 +50,8 @@ class SchedulerKvEventsPublisher:
     max_running_requests: int
     max_total_num_tokens: int
     get_stats: Callable
+    # This rank's Rust server relays the events over its gRPC port.
+    local_relay: bool = False
     enable_kv_cache_events: bool = False
     kv_event_publisher: Any = None
     metrics_drop_warned: bool = False
@@ -68,10 +69,7 @@ class SchedulerKvEventsPublisher:
                 select_kv_publisher_dp_rank(
                     parallel.attn_dp_size, parallel.attn_dp_rank, parallel.dp_rank
                 ),
-                # This rank hosts the Rust server, which relays the events
-                # over its gRPC port.
-                local_relay=envs.SGLANG_RUST_SERVER.get()
-                and get_serving().grpc_port is not None,
+                local_relay=self.local_relay,
             )
 
     def emit_kv_metrics(self):

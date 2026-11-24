@@ -4345,7 +4345,6 @@ class KvEventSource(msgspec.Struct, kw_only=True, frozen=True):
     endpoint: str = ""
     topic: str = ""
     block_size: int = 0
-    transport: str = ""
 
     @classmethod
     def from_json_value(cls, value: Any) -> "KvEventSource":
@@ -12283,8 +12282,6 @@ def decode_KvEventSource(value: Any) -> KvEventSource:
             kw["topic"] = _expect_str(x, expected="a string")
         elif key == "block_size":
             kw["block_size"] = _expect_uint(x, expected="u32")
-        elif key == "transport":
-            kw["transport"] = _expect_str(x, expected="a string")
     return KvEventSource(**kw)
 
 
@@ -12294,5 +12291,4 @@ def encode_KvEventSource(v: KvEventSource) -> Dict[str, Any]:
     d["endpoint"] = v.endpoint
     d["topic"] = v.topic
     d["block_size"] = v.block_size
-    d["transport"] = v.transport
     return d

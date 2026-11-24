@@ -2,6 +2,11 @@
 //! sockets (`python/sglang/srt/disaggregation/kv_events.py`). The relay
 //! forwards batches as the PUB socket delivers them and keeps no history:
 //! each reader fills its own gaps from the publisher's replay buffer.
+//!
+//! The publisher runs in this process, yet the relay reads it over ZeroMQ so
+//! that its replay buffer stays the only history and it gains only two binds.
+//! vLLM's Rust server, a separate process from its engine, relays the same
+//! way, so one design and one client contract serve both engines.
 
 use std::collections::VecDeque;
 use std::sync::Arc;
@@ -16,7 +21,7 @@ use super::wire::decode_batch;
 use crate::message::config::KvEventRelayConfig;
 
 /// Live batches a reader may fall behind by before it is caught up from the
-/// publisher's replay buffer.
+/// publisher's replay buffer. Arbitrary.
 const LIVE_CAPACITY: usize = 1024;
 /// Pause after a failed read from the publisher. Arbitrary.
 const RETRY_DELAY: Duration = Duration::from_secs(1);
@@ -34,7 +39,7 @@ pub(super) enum ReadError {
     /// Batches after the last one read can no longer be recovered.
     DataLoss,
     /// The publisher's replay socket did not answer.
-    ReplayFailed(ReplayError),
+    ReplayFailed(PublisherError),
     /// The relay stopped with the server.
     RelayStopped,
 }
@@ -89,7 +94,9 @@ impl KvEventRelay {
                 return Err(ReadError::OutOfRange);
             }
             reader.next = Some(cursor.next_sequence_number);
-            reader.catch_up(ReadError::OutOfRange).await?;
+            reader
+                .catch_up(cursor.next_sequence_number, ReadError::OutOfRange)
+                .await?;
         }
         Ok(reader)
     }
@@ -100,6 +107,8 @@ async fn follow(
     live: broadcast::Sender<Arc<pb::KvEventBatch>>,
     forwarded: watch::Sender<Option<u64>>,
 ) {
+    // The publisher binds before this server starts, so no failure is expected;
+    // this task has no caller to return one to, so it logs and retries.
     let mut socket = loop {
         match subscribe(&endpoint).await {
             Ok(socket) => break socket,
@@ -110,18 +119,20 @@ async fn follow(
         }
     };
     loop {
-        let message = match socket.recv().await {
-            Ok(message) => message,
+        let (sequence_number, payload) = match next_published(&mut socket).await {
+            Ok(published) => published,
             Err(error) => {
                 tracing::warn!(%error, "failed to read KV events from the scheduler");
                 tokio::time::sleep(RETRY_DELAY).await;
                 continue;
             }
         };
-        let Some((sequence_number, payload)) = published_batch(&message.into_vec()) else {
-            tracing::warn!("dropping a malformed KV event message");
+        forwarded.send_replace(Some(sequence_number + 1));
+        // A reader subscribes before it reads `forwarded`: it is counted here,
+        // or it starts after this batch.
+        if live.receiver_count() == 0 {
             continue;
-        };
+        }
         // A batch that cannot be decoded is a gap that readers cannot fill.
         let batch = match decode_batch(sequence_number, &payload) {
             Ok(batch) => batch,
@@ -130,7 +141,6 @@ async fn follow(
                 continue;
             }
         };
-        forwarded.send_replace(Some(sequence_number + 1));
         // No receiver is not an error: readers come and go.
         let _ = live.send(Arc::new(batch));
     }
@@ -143,6 +153,12 @@ async fn subscribe(endpoint: &str) -> Result<SubSocket, zeromq::ZmqError> {
     Ok(socket)
 }
 
+/// The next batch the publisher sends, as `(sequence number, payload)`.
+async fn next_published(socket: &mut SubSocket) -> Result<(u64, Bytes), PublisherError> {
+    let message = socket.recv().await?;
+    published_batch(&message.into_vec()).ok_or(PublisherError::Malformed)
+}
+
 /// One subscriber's position in the relay's stream.
 pub(super) struct KvEventReader {
     live: broadcast::Receiver<Arc<pb::KvEventBatch>>,
@@ -151,17 +167,20 @@ pub(super) struct KvEventReader {
     /// forwards its first batch.
     next: Option<u64>,
     forwarded: watch::Receiver<Option<u64>>,
-    /// Replayed batches to yield before live ones.
-    pending: VecDeque<Arc<pb::KvEventBatch>>,
+    /// Replayed batches to yield before live ones, decoded when yielded.
+    pending: VecDeque<(u64, Bytes)>,
 }
 
 impl KvEventReader {
     /// The next batch, each sequence number once and in order.
     pub(super) async fn next_batch(&mut self) -> Result<Arc<pb::KvEventBatch>, ReadError> {
         loop {
-            if let Some(batch) = self.pending.pop_front() {
-                self.next = Some(batch.sequence_number + 1);
-                return Ok(batch);
+            if let Some((sequence_number, payload)) = self.pending.pop_front() {
+                // As in `follow`, an undecodable batch is a gap that cannot be filled.
+                let batch =
+                    decode_batch(sequence_number, &payload).map_err(|_| ReadError::DataLoss)?;
+                self.next = Some(sequence_number + 1);
+                return Ok(Arc::new(batch));
             }
             match self.live.recv().await {
                 Ok(batch) => match self.next {
@@ -178,54 +197,49 @@ impl KvEventReader {
                 Err(broadcast::error::RecvError::Lagged(_)) => {}
                 Err(broadcast::error::RecvError::Closed) => return Err(ReadError::RelayStopped),
             }
+            // A subscriber that lagged before its first batch has no position.
+            let next = self.next.ok_or(ReadError::DataLoss)?;
             // The publisher buffers a batch before it serves the next replay,
             // so the replay holds the live batches this reader has received.
-            self.catch_up(ReadError::DataLoss).await?;
+            self.catch_up(next, ReadError::DataLoss).await?;
         }
     }
 
     /// Queue the publisher's buffered batches from `next` on. `missing` is the
     /// error when the buffer cannot continue the stream from `next`.
-    async fn catch_up(&mut self, missing: ReadError) -> Result<(), ReadError> {
-        // A subscriber that lagged before its first batch has no position.
-        let Some(next) = self.next else {
-            return Err(missing);
-        };
+    async fn catch_up(&mut self, next: u64, missing: ReadError) -> Result<(), ReadError> {
         // Read before the replay: a batch published after it is not missing.
         let published = self.forwarded.borrow().is_some_and(|end| next < end);
         let batches = replay(&self.replay_endpoint, next)
             .await
             .map_err(ReadError::ReplayFailed)?;
-        if batches.is_empty() && published {
+        // Not so when the buffer starts later or the publisher skipped a number.
+        let contiguous = batches
+            .iter()
+            .zip(next..)
+            .all(|((sequence_number, _), expected)| *sequence_number == expected);
+        if !contiguous || (batches.is_empty() && published) {
             return Err(missing);
         }
-        for (expected, (sequence_number, payload)) in (next..).zip(batches) {
-            // The buffer starts later, or the publisher skipped a number.
-            if sequence_number != expected {
-                return Err(missing);
-            }
-            let Ok(batch) = decode_batch(sequence_number, &payload) else {
-                return Err(missing);
-            };
-            self.pending.push_back(Arc::new(batch));
-        }
+        self.pending = batches.into();
         Ok(())
     }
 }
 
+/// Why the publisher's next batch cannot be read.
 #[derive(Debug, thiserror::Error)]
-pub(super) enum ReplayError {
+pub(super) enum PublisherError {
     #[error(transparent)]
     Zmq(#[from] zeromq::ZmqError),
     #[error("the publisher sent no replay frame within {REPLAY_TIMEOUT:?}")]
     Timeout,
-    #[error("malformed replay frame")]
+    #[error("malformed frame")]
     Malformed,
 }
 
 /// The publisher's buffered batches from `start` on, in order. Read in full
 /// before any is used, so a slow gRPC client cannot hold up the publisher.
-async fn replay(endpoint: &str, start: u64) -> Result<Vec<(u64, Bytes)>, ReplayError> {
+async fn replay(endpoint: &str, start: u64) -> Result<Vec<(u64, Bytes)>, PublisherError> {
     let mut socket = DealerSocket::new();
     socket.connect(endpoint).await?;
     // The empty frame is the REQ envelope the publisher's ROUTER expects.
@@ -237,12 +251,12 @@ async fn replay(endpoint: &str, start: u64) -> Result<Vec<(u64, Bytes)>, ReplayE
     loop {
         let message = tokio::time::timeout(REPLAY_TIMEOUT, socket.recv())
             .await
-            .map_err(|_| ReplayError::Timeout)??;
+            .map_err(|_| PublisherError::Timeout)??;
         // A published batch's frames follow the empty REP envelope.
         match message.into_vec().get(1..).and_then(published_batch) {
             Some((REPLAY_END, _)) => return Ok(batches),
             Some(batch) => batches.push(batch),
-            None => return Err(ReplayError::Malformed),
+            None => return Err(PublisherError::Malformed),
         }
     }
 }

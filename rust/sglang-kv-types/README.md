@@ -12,6 +12,6 @@ The gRPC client lives at
 tonic 0.14 and prost 0.14 types.
 
 `sglang-kv-types` is versioned on its own semver track, independent of SGLang
-and `sglang-api-types` releases, with the same rules as `sglang-api-types`: a
-minor bump for any schema, generated-API or dependency change, a patch bump for
-documentation or metadata only.
+and `sglang-api-types` releases: a minor bump for any schema, generated-API or
+dependency change, a patch bump for documentation or metadata only. No workflow
+publishes it yet: its first release to crates.io is a maintainer step.

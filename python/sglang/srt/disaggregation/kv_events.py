@@ -449,9 +449,6 @@ class ZmqEventPublisher(EventPublisher):
             replay_endpoint, self._dp_rank
         )
         self._hwm = hwm
-        # ZMQ acks reads only every HWM/2 messages, so the sender can see up to
-        # HWM/2 stale messages; 2x lets a full replay plus marker always fit.
-        self._replay_hwm = 2 * (buffer_steps + 1)
         self._local_relay = local_relay
         self._relay_dir: Optional[str] = None
         self._socket_setup()
@@ -521,8 +518,8 @@ class ZmqEventPublisher(EventPublisher):
         return {
             "dp_rank": self._dp_rank,
             "block_size": block_size,
-            "endpoint": f"ipc://{self._relay_dir}/events",
-            "replay_endpoint": f"ipc://{self._relay_dir}/replay",
+            "endpoint": f"ipc://{self._relay_dir}/e",
+            "replay_endpoint": f"ipc://{self._relay_dir}/r",
         }
 
     def shutdown(self) -> None:
@@ -596,9 +593,12 @@ class ZmqEventPublisher(EventPublisher):
         # 1) handles multiple REQ clients (identities)
         # 2) lets us send back one request → many replies (streamed events)
         # 3) works in our non‑blocking poll loop alongside PUB
-        if self._replay_endpoint is not None:
+        if self._replay_endpoint is not None or self._local_relay:
             self._replay = self._ctx.socket(zmq.ROUTER)
-            self._replay.setsockopt(zmq.SNDHWM, self._replay_hwm)
+            # ZMQ acks reads only every HWM/2 messages, so the sender can see up to
+            # HWM/2 stale messages; 2x lets a full replay plus marker always fit.
+            self._replay.setsockopt(zmq.SNDHWM, 2 * (self._buffer.maxlen + 1))
+        if self._replay_endpoint is not None:
             logger.debug(
                 f"ZmqEventPublisher socket replay_endpoint bind to {self._replay_endpoint}"
             )
@@ -607,13 +607,11 @@ class ZmqEventPublisher(EventPublisher):
 
         # After the user's endpoints, whose bound addresses are read above.
         if self._local_relay:
-            # Mode 0700: only this user can reach the relay's sockets.
-            self._relay_dir = tempfile.mkdtemp(prefix="sglang-kv-events-")
-            self._pub.bind(f"ipc://{self._relay_dir}/events")
-            if self._replay is None:
-                self._replay = self._ctx.socket(zmq.ROUTER)
-                self._replay.setsockopt(zmq.SNDHWM, self._replay_hwm)
-            self._replay.bind(f"ipc://{self._relay_dir}/replay")
+            # Mode 0700: only this user can reach the relay's sockets. They add 12 bytes
+            # to the temp directory, as other ipc sockets do: a socket path holds 107.
+            self._relay_dir = tempfile.mkdtemp(prefix="k")
+            self._pub.bind(f"ipc://{self._relay_dir}/e")
+            self._replay.bind(f"ipc://{self._relay_dir}/r")
 
     @staticmethod
     def _bound_endpoint(socket: zmq.Socket) -> str:

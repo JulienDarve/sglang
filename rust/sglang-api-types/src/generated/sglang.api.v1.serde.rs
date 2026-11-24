@@ -25049,7 +25049,6 @@ impl ::serde::Serialize for KvEventSource {
         ::serde::ser::SerializeMap::serialize_entry(&mut map, "endpoint", &self.endpoint)?;
         ::serde::ser::SerializeMap::serialize_entry(&mut map, "topic", &self.topic)?;
         ::serde::ser::SerializeMap::serialize_entry(&mut map, "block_size", &self.block_size)?;
-        ::serde::ser::SerializeMap::serialize_entry(&mut map, "transport", &self.transport)?;
         ::serde::ser::SerializeMap::end(map)
     }
 }
@@ -25070,7 +25069,6 @@ impl<'de> ::serde::Deserialize<'de> for KvEventSource {
                 let mut f_endpoint = None;
                 let mut f_topic = None;
                 let mut f_block_size = None;
-                let mut f_transport = None;
                 while let Some(key) = map.next_key::<::std::borrow::Cow<'_, str>>()? {
                     match key.as_ref() {
                         "dp_rank" => {
@@ -25097,12 +25095,6 @@ impl<'de> ::serde::Deserialize<'de> for KvEventSource {
                             }
                             f_block_size = Some(map.next_value::<u32>()?);
                         }
-                        "transport" => {
-                            if f_transport.is_some() {
-                                return Err(::serde::de::Error::duplicate_field("transport"));
-                            }
-                            f_transport = Some(map.next_value::<::prost::alloc::string::String>()?);
-                        }
                         _ => {
                             map.next_value::<::serde::de::IgnoredAny>()?;
                         }
@@ -25113,7 +25105,6 @@ impl<'de> ::serde::Deserialize<'de> for KvEventSource {
                     endpoint: f_endpoint.unwrap_or_default(),
                     topic: f_topic.unwrap_or_default(),
                     block_size: f_block_size.unwrap_or_default(),
-                    transport: f_transport.unwrap_or_default(),
                 })
             }
         }

@@ -122,7 +122,6 @@ pub(super) fn server_info(info: ServerInfo) -> Result<api::GetServerInfoResponse
                     endpoint: source.endpoint,
                     topic: source.topic,
                     block_size: source.block_size,
-                    transport: "zmq".to_owned(),
                 })
                 .collect(),
             // The relayed stream; an empty endpoint is this gRPC server.
@@ -134,7 +133,6 @@ pub(super) fn server_info(info: ServerInfo) -> Result<api::GetServerInfoResponse
                     endpoint: String::new(),
                     topic: String::new(),
                     block_size: relay.block_size,
-                    transport: "grpc".to_owned(),
                 })
                 .collect(),
             node_listeners: deployment_info

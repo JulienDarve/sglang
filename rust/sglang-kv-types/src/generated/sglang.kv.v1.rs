@@ -7,6 +7,8 @@ pub struct SubscribeKvEventsRequest {
     #[prost(message, optional, tag = "2")]
     pub resume: ::core::option::Option<KvEventCursor>,
 }
+/// A cursor past the newest batch is accepted and waits for that number; an
+/// empty `stream_id` gives up the detection of a server restart.
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct KvEventCursor {
     /// empty: the current stream

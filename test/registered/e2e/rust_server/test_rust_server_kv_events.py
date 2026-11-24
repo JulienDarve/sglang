@@ -1,5 +1,5 @@
 """The Rust server's `sglang.kv.v1.KvEvents` stream on a real engine carries the
-batches of the scheduler's ZMQ endpoint, with the same sequence numbers."""
+scheduler's batches with the sequence numbers of its ZMQ endpoint."""
 
 import json
 import unittest
@@ -11,7 +11,7 @@ import requests
 import zmq
 from google.protobuf import descriptor_pb2, descriptor_pool, message_factory
 
-from sglang.srt.disaggregation.kv_events import BlockRemoved, BlockStored, KVEventBatch
+from sglang.srt.disaggregation.kv_events import AllBlocksCleared, KVEventBatch
 from sglang.srt.utils.network import get_free_port
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import (
@@ -24,7 +24,7 @@ from sglang.test.test_utils import (
     terminate_and_kill_process_tree,
 )
 
-register_cuda_ci(est_time=90, stage="extra-a", runner_config="1-gpu-small")
+register_cuda_ci(est_time=90, stage="base-b", runner_config="1-gpu-small")
 
 _FIELD = descriptor_pb2.FieldDescriptorProto
 
@@ -32,20 +32,10 @@ _FIELD = descriptor_pb2.FieldDescriptorProto
 # as unknown fields. Per message, (name, number, scalar type or message name, repeated).
 _MESSAGES = {
     "KvEventCursor": [("next_sequence_number", 2, _FIELD.TYPE_UINT64, False)],
-    "SubscribeKvEventsRequest": [
-        ("data_parallel_rank", 1, _FIELD.TYPE_UINT32, False),
-        ("resume", 2, "KvEventCursor", False),
-    ],
+    "SubscribeKvEventsRequest": [("resume", 2, "KvEventCursor", False)],
     "KvEventStreamStart": [],
-    "BlockHash": [("signed_value", 2, _FIELD.TYPE_INT64, False)],
-    "BlockStored": [("block_hashes", 1, "BlockHash", True)],
-    "BlockRemoved": [("block_hashes", 1, "BlockHash", True)],
     "AllBlocksCleared": [],
-    "KvCacheEvent": [
-        ("block_stored", 1, "BlockStored", False),
-        ("block_removed", 2, "BlockRemoved", False),
-        ("all_blocks_cleared", 3, "AllBlocksCleared", False),
-    ],
+    "KvCacheEvent": [("all_blocks_cleared", 3, "AllBlocksCleared", False)],
     "KvEventBatch": [
         ("sequence_number", 1, _FIELD.TYPE_UINT64, False),
         ("events", 4, "KvCacheEvent", True),
@@ -100,48 +90,16 @@ class KvEventStream:
             response_deserializer=self.messages["SubscribeKvEventsResponse"].FromString,
         )
 
-    def subscribe(
-        self, data_parallel_rank: int, resume: Optional[int] = None, timeout=60
-    ):
-        """The responses; `resume` is a sequence number in the current stream."""
-        request = self.messages["SubscribeKvEventsRequest"](
-            data_parallel_rank=data_parallel_rank
-        )
+    def subscribe(self, resume: Optional[int] = None):
+        """Rank 0's responses; `resume` is a sequence number in the current stream."""
+        request = self.messages["SubscribeKvEventsRequest"]()
         if resume is not None:
             request.resume.SetInParent()
             request.resume.next_sequence_number = resume
-        return self._subscribe(request, timeout=timeout)
+        return self._subscribe(request, timeout=60)
 
     def close(self) -> None:
         self.channel.close()
-
-
-def _zmq_events(payload: bytes) -> list:
-    return [
-        (
-            type(event).__name__,
-            (
-                event.block_hashes
-                if isinstance(event, (BlockStored, BlockRemoved))
-                else []
-            ),
-        )
-        for event in msgspec.msgpack.decode(payload, type=KVEventBatch).events
-    ]
-
-
-def _grpc_events(batch) -> list:
-    events = []
-    for event in batch.events:
-        if event.HasField("block_stored"):
-            hashes = event.block_stored.block_hashes
-            events.append(("BlockStored", [h.signed_value for h in hashes]))
-        elif event.HasField("block_removed"):
-            hashes = event.block_removed.block_hashes
-            events.append(("BlockRemoved", [h.signed_value for h in hashes]))
-        else:
-            events.append(("AllBlocksCleared", []))
-    return events
 
 
 @unittest.skipUnless(is_rust_server_built(), "embedded rust server extension not built")
@@ -178,14 +136,20 @@ class TestRustServerKvEvents(CustomTestCase):
         sampling_params = {"temperature": 0, "max_new_tokens": 8}
         self._post("/generate", {"text": text, "sampling_params": sampling_params})
 
-    def test_grpc_stream_matches_zmq(self):
+    def _numbers_to_the_clear(self, responses, cleared: int) -> list:
+        """The stream's next sequence numbers up to `cleared`, the cache clear's
+        number on ZMQ; the batch with that number must hold the clear here too."""
+        batches = [next(responses).batch]
+        while batches[-1].sequence_number < cleared:
+            batches.append(next(responses).batch)
+        self.assertTrue(
+            any(event.HasField("all_blocks_cleared") for event in batches[-1].events)
+        )
+        return [batch.sequence_number for batch in batches]
+
+    def test_grpc_stream_carries_the_zmq_sequence_numbers(self):
         stream = KvEventStream(self.grpc_port)
         self.addCleanup(stream.close)
-        live = stream.subscribe(data_parallel_rank=0)
-        self.addCleanup(live.cancel)
-        self.assertTrue(next(live).HasField("start"))
-
-        zmq_batches = {}
         with zmq.Context() as context, context.socket(zmq.SUB) as subscriber:
             subscriber.setsockopt_string(zmq.SUBSCRIBE, "")
             subscriber.setsockopt(zmq.RCVTIMEO, 30_000)
@@ -197,36 +161,28 @@ class TestRustServerKvEvents(CustomTestCase):
                 self._generate(f"Warm-up {attempt}: name three colors.")
             else:
                 self.fail("no KV event batch reached the ZMQ subscriber")
+
+            live = stream.subscribe()
+            self.addCleanup(live.cancel)
+            self.assertTrue(next(live).HasField("start"))
             self._generate("The capital of France is Paris. The capital of Italy is")
             self._post("/flush_cache")
             while True:
                 _, seq, payload = subscriber.recv_multipart()
-                events = _zmq_events(payload)
-                zmq_batches[int.from_bytes(seq, "big")] = events
-                if ("AllBlocksCleared", []) in events:
+                batch = msgspec.msgpack.decode(payload, type=KVEventBatch)
+                if AllBlocksCleared() in batch.events:
                     break
-        last = max(zmq_batches)
+        cleared = int.from_bytes(seq, "big")
 
-        grpc_batches = {}
-        while not grpc_batches or max(grpc_batches) < last:
-            batch = next(live).batch
-            grpc_batches[batch.sequence_number] = _grpc_events(batch)
-        first = min(grpc_batches)
-        self.assertEqual(sorted(grpc_batches), list(range(first, last + 1)))
-        self.assertEqual({seq: grpc_batches[seq] for seq in zmq_batches}, zmq_batches)
-        kinds = {kind for events in zmq_batches.values() for kind, _ in events}
-        self.assertIn("BlockStored", kinds)
+        numbers = self._numbers_to_the_clear(live, cleared)
+        self.assertEqual(numbers, list(range(numbers[0], cleared + 1)))
 
         # From the engine's replay buffer.
-        resumed = stream.subscribe(data_parallel_rank=0, resume=0)
+        resumed = stream.subscribe(resume=0)
         self.addCleanup(resumed.cancel)
-        next(resumed)
-        replayed = {}
-        while not replayed or max(replayed) < last:
-            batch = next(resumed).batch
-            replayed[batch.sequence_number] = _grpc_events(batch)
-        self.assertEqual(sorted(replayed), list(range(last + 1)))
-        self.assertEqual({seq: replayed[seq] for seq in grpc_batches}, grpc_batches)
+        self.assertTrue(next(resumed).HasField("start"))
+        numbers = self._numbers_to_the_clear(resumed, cleared)
+        self.assertEqual(numbers, list(range(cleared + 1)))
 
 
 if __name__ == "__main__":

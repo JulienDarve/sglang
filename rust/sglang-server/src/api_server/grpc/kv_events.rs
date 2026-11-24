@@ -76,13 +76,11 @@ fn responses(
         yield response(Item::Start(start));
         loop {
             let batch = tokio::select! {
-                _ = stop.wait_for(|stop| *stop) => None,
-                batch = reader.next_batch() => Some(batch),
-            };
-            let batch = match batch {
-                Some(batch) => batch.map_err(read_status)?,
-                None => Err(Status::unavailable("the server is shutting down"))?,
-            };
+                _ = stop.wait_for(|stop| *stop) => {
+                    Err(Status::unavailable("the server is shutting down"))
+                }
+                batch = reader.next_batch() => batch.map_err(read_status),
+            }?;
             yield response(Item::Batch(Arc::unwrap_or_clone(batch)));
         }
     }
@@ -95,7 +93,8 @@ fn read_status(error: ReadError) -> Status {
              stream is not the current one",
         ),
         ReadError::DataLoss => Status::data_loss(
-            "KV event batches after the last one sent are no longer in the engine's replay buffer",
+            "KV event batches after the last one sent can no longer be recovered from the \
+             engine's replay buffer",
         ),
         ReadError::ReplayFailed(error) => {
             Status::unavailable(format!("the engine's KV event replay failed: {error}"))
