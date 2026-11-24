@@ -5,8 +5,6 @@
 //! mounts the `api.v1` adapter on the transport-neutral
 //! [`crate::api_server::handlers::CoreHandle`] contract.
 
-use std::sync::Arc;
-
 use sglang_api_types::api::v1::sglang_service_server::SglangServiceServer;
 use sglang_kv_types::kv::v1::kv_events_server::KvEventsServer;
 use tokio_stream::wrappers::TcpListenerStream;
@@ -56,7 +54,7 @@ fn max_message_size() -> usize {
 pub(crate) async fn serve(
     listener: std::net::TcpListener,
     service: GrpcService,
-    kv_event_relay: Option<Arc<KvEventRelay>>,
+    kv_event_relay: Option<KvEventRelay>,
     core: CoreHandle,
     shutdown: flume::Receiver<()>,
 ) {

@@ -3,15 +3,17 @@ batches of the scheduler's ZMQ endpoint, with the same sequence numbers."""
 
 import json
 import unittest
+from typing import Optional
 
+import grpc
 import msgspec
 import requests
 import zmq
+from google.protobuf import descriptor_pb2, descriptor_pool, message_factory
 
 from sglang.srt.disaggregation.kv_events import BlockRemoved, BlockStored, KVEventBatch
 from sglang.srt.utils.network import get_free_port
 from sglang.test.ci.ci_register import register_cuda_ci
-from sglang.test.kv_event_stream import KvEventStream
 from sglang.test.test_utils import (
     DEFAULT_SMALL_MODEL_NAME_FOR_TEST,
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
@@ -23,6 +25,95 @@ from sglang.test.test_utils import (
 )
 
 register_cuda_ci(est_time=90, stage="extra-a", runner_config="1-gpu-small")
+
+_FIELD = descriptor_pb2.FieldDescriptorProto
+
+# The fields this test reads (proto/sglang/kv/v1/kv_events.proto); the rest decode
+# as unknown fields. Per message, (name, number, scalar type or message name, repeated).
+_MESSAGES = {
+    "KvEventCursor": [("next_sequence_number", 2, _FIELD.TYPE_UINT64, False)],
+    "SubscribeKvEventsRequest": [
+        ("data_parallel_rank", 1, _FIELD.TYPE_UINT32, False),
+        ("resume", 2, "KvEventCursor", False),
+    ],
+    "KvEventStreamStart": [],
+    "BlockHash": [("signed_value", 2, _FIELD.TYPE_INT64, False)],
+    "BlockStored": [("block_hashes", 1, "BlockHash", True)],
+    "BlockRemoved": [("block_hashes", 1, "BlockHash", True)],
+    "AllBlocksCleared": [],
+    "KvCacheEvent": [
+        ("block_stored", 1, "BlockStored", False),
+        ("block_removed", 2, "BlockRemoved", False),
+        ("all_blocks_cleared", 3, "AllBlocksCleared", False),
+    ],
+    "KvEventBatch": [
+        ("sequence_number", 1, _FIELD.TYPE_UINT64, False),
+        ("events", 4, "KvCacheEvent", True),
+    ],
+    "SubscribeKvEventsResponse": [
+        ("start", 1, "KvEventStreamStart", False),
+        ("batch", 2, "KvEventBatch", False),
+    ],
+}
+
+
+def _message_classes() -> dict:
+    file = descriptor_pb2.FileDescriptorProto(
+        name="sglang/kv/v1/kv_events_test.proto",
+        package="sglang.kv.v1",
+        syntax="proto3",
+    )
+    for name, fields in _MESSAGES.items():
+        message = file.message_type.add(name=name)
+        for field_name, number, kind, repeated in fields:
+            field = message.field.add(
+                name=field_name,
+                number=number,
+                label=_FIELD.LABEL_REPEATED if repeated else _FIELD.LABEL_OPTIONAL,
+            )
+            if isinstance(kind, str):
+                field.type = _FIELD.TYPE_MESSAGE
+                field.type_name = f".sglang.kv.v1.{kind}"
+            else:
+                field.type = kind
+    pool = descriptor_pool.DescriptorPool()
+    pool.Add(file)
+    return {
+        name: message_factory.GetMessageClass(
+            pool.FindMessageTypeByName(f"sglang.kv.v1.{name}")
+        )
+        for name in _MESSAGES
+    }
+
+
+class KvEventStream:
+    """`SubscribeKvEvents` on the Rust server's gRPC port."""
+
+    def __init__(self, grpc_port: int):
+        self.messages = _message_classes()
+        self.channel = grpc.insecure_channel(
+            f"127.0.0.1:{grpc_port}", options=[("grpc.enable_http_proxy", 0)]
+        )
+        self._subscribe = self.channel.unary_stream(
+            "/sglang.kv.v1.KvEvents/SubscribeKvEvents",
+            request_serializer=lambda request: request.SerializeToString(),
+            response_deserializer=self.messages["SubscribeKvEventsResponse"].FromString,
+        )
+
+    def subscribe(
+        self, data_parallel_rank: int, resume: Optional[int] = None, timeout=60
+    ):
+        """The responses; `resume` is a sequence number in the current stream."""
+        request = self.messages["SubscribeKvEventsRequest"](
+            data_parallel_rank=data_parallel_rank
+        )
+        if resume is not None:
+            request.resume.SetInParent()
+            request.resume.next_sequence_number = resume
+        return self._subscribe(request, timeout=timeout)
+
+    def close(self) -> None:
+        self.channel.close()
 
 
 def _zmq_events(payload: bytes) -> list:

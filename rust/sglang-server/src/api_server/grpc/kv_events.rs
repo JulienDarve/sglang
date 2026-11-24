@@ -20,14 +20,14 @@ use super::service::ResponseStream;
 
 pub(crate) struct KvEventsService {
     /// `None` when this listener's scheduler publishes no KV events over ZMQ.
-    relay: Option<Arc<KvEventRelay>>,
+    relay: Option<KvEventRelay>,
     /// Turns true to end every stream, which a graceful shutdown would
     /// otherwise wait for.
     stop: watch::Receiver<bool>,
 }
 
 impl KvEventsService {
-    pub(crate) fn new(relay: Option<Arc<KvEventRelay>>, stop: watch::Receiver<bool>) -> Self {
+    pub(crate) fn new(relay: Option<KvEventRelay>, stop: watch::Receiver<bool>) -> Self {
         Self { relay, stop }
     }
 }
@@ -41,7 +41,7 @@ impl KvEvents for KvEventsService {
         request: Request<pb::SubscribeKvEventsRequest>,
     ) -> Result<Response<Self::SubscribeKvEventsStream>, Status> {
         let request = request.into_inner();
-        let relay = self.relay.clone().ok_or_else(|| {
+        let relay = self.relay.as_ref().ok_or_else(|| {
             Status::failed_precondition(
                 "this server's scheduler publishes no KV cache events over ZMQ; enable them \
                  with --kv-events-config and the zmq publisher",
@@ -54,8 +54,12 @@ impl KvEvents for KvEventsService {
             )));
         }
         let reader = relay.reader(request.resume).await.map_err(read_status)?;
+        let start = pb::KvEventStreamStart {
+            stream_id: relay.stream_id.clone(),
+            data_parallel_rank: relay.dp_rank,
+        };
         Ok(Response::new(Box::pin(responses(
-            relay,
+            start,
             reader,
             self.stop.clone(),
         ))))
@@ -64,15 +68,12 @@ impl KvEvents for KvEventsService {
 
 /// `start`, then the reader's batches until an error or shutdown.
 fn responses(
-    relay: Arc<KvEventRelay>,
+    start: pb::KvEventStreamStart,
     mut reader: KvEventReader,
     mut stop: watch::Receiver<bool>,
 ) -> impl futures::Stream<Item = Result<pb::SubscribeKvEventsResponse, Status>> + Send + 'static {
     async_stream::try_stream! {
-        yield response(Item::Start(pb::KvEventStreamStart {
-            stream_id: relay.stream_id().to_owned(),
-            data_parallel_rank: relay.dp_rank,
-        }));
+        yield response(Item::Start(start));
         loop {
             let batch = tokio::select! {
                 _ = stop.wait_for(|stop| *stop) => None,

@@ -8,14 +8,14 @@ the router can subscribe per replica (the `dp_size` it reads from
 """
 
 import atexit
-import importlib
 import json
+import os
 import threading
 import time
 import unittest
+from typing import get_args, get_type_hints
 from unittest.mock import patch
 
-import grpc
 import msgspec
 import zmq
 
@@ -37,11 +37,15 @@ from sglang.srt.runtime_context import describe_kv_events_publisher
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils.network import get_free_port
 from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.kv_event_stream import KvEventStream
-from sglang.test.rust_server_args import standalone_server_args
-from sglang.test.test_utils import CustomTestCase, is_rust_server_built
+from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=16, suite="base-a-test-cpu")
+register_cpu_ci(est_time=12, suite="base-a-test-cpu")
+
+RUST_KV_EVENT_BATCH_FIXTURE = os.path.join(
+    os.path.dirname(__file__),
+    *[os.pardir] * 4,
+    "rust/sglang-server/testdata/kv_event_batch.hex",
+)
 
 
 class TestLocalKvEventSource(CustomTestCase):
@@ -192,14 +196,17 @@ class TestBlockStoredWireFormat(CustomTestCase):
 
 class TestRustServerDecodedFields(CustomTestCase):
     def test_event_fields_match_the_rust_server_decoder(self):
-        """The Rust server's KvEvents relay decodes exactly these fields
-        (rust/sglang-server/src/api_server/grpc/kv_events/wire.rs) and drops any
-        other; a new one belongs there and in proto/sglang/kv/v1 too."""
+        """The Rust server's KvEvents relay decodes exactly these event types and
+        fields (rust/sglang-server/src/api_server/grpc/kv_events/wire.rs): it
+        drops any other field and cannot decode any other type, so a new one
+        belongs there and in proto/sglang/kv/v1 too. Its test decodes the
+        fixture, which holds a batch with every field as published."""
         self.assertEqual(EventBatch.__struct_fields__, ("ts", "events", "attn_dp_rank"))
+        (events,) = get_args(get_type_hints(KVEventBatch)["events"])
         self.assertEqual(
             {
                 event.__struct_config__.tag: event.__struct_fields__
-                for event in (BlockStored, BlockRemoved, AllBlocksCleared)
+                for event in get_args(events)
             },
             {
                 "BlockStored": (
@@ -218,6 +225,38 @@ class TestRustServerDecodedFields(CustomTestCase):
                 "AllBlocksCleared": (),
             },
         )
+        batch = KVEventBatch(
+            ts=1.5,
+            attn_dp_rank=3,
+            events=[
+                BlockStored(
+                    block_hashes=[-7, 2**62],
+                    parent_block_hash=-1,
+                    token_ids=[1, 2, 2**40, 3],
+                    block_size=2,
+                    lora_id=5,
+                    medium=StorageMedium.CPU,
+                    cache_salt="salt",
+                    session_id="session",
+                    lora_name="adapter",
+                    mm_routing_spans=[[(0, 1, "image")], []],
+                ),
+                # An EAGLE page: (token, next token) pairs.
+                BlockStored(
+                    block_hashes=[11],
+                    parent_block_hash=None,
+                    token_ids=[(1, 2), (2, 3)],
+                    block_size=2,
+                    lora_id=None,
+                ),
+                BlockRemoved(block_hashes=[-7], medium=StorageMedium.GPU),
+                AllBlocksCleared(),
+            ],
+        )
+        with open(RUST_KV_EVENT_BATCH_FIXTURE) as fixture:
+            self.assertEqual(
+                msgspec.msgpack.encode(batch).hex(), fixture.read().strip()
+            )
 
 
 class TestNamespacedBlockHash(CustomTestCase):
@@ -327,101 +366,66 @@ class TestReplay(CustomTestCase):
             self.assertEqual(numbers, list(range(first, first + steps)))
 
 
-def _rust_server(ext, grpc_port: int, kv_event_relay):
-    return ext.Server(
-        standalone_server_args(
-            ext,
-            port=get_free_port(),
-            grpc_port=grpc_port,
-            deployment_info=json.dumps({"kv_event_relay": kv_event_relay}),
-        )
-    )
+class TestLocalRelay(CustomTestCase):
+    def test_private_sockets_carry_the_configured_endpoint_stream(self):
+        """The private sockets the Rust server relays carry the batches,
+        sequence numbers and replay of the configured endpoint, and only a
+        publishing zmq publisher binds them."""
+        for config in (None, json.dumps({"publisher": "null"})):
+            off = EventPublisherFactory.create(config, local_relay=True)
+            self.assertIsNone(off.describe_local_relay(16))
 
-
-@unittest.skipUnless(is_rust_server_built(), "embedded rust server extension not built")
-class TestRustServerKvEventStream(CustomTestCase):
-    """The Rust server's `sglang.kv.v1.KvEvents` stream of the real publisher."""
-
-    def setUp(self):
-        self.ext = importlib.import_module("sglang.srt.rust_extensions._server")
-        self.grpc_port = get_free_port()
-        self.stream = KvEventStream(self.grpc_port)
-        self.addCleanup(self.stream.close)
-
-    def _subscribe(self, resume=None):
-        responses = self.stream.subscribe(data_parallel_rank=2, resume=resume)
-        self.addCleanup(responses.cancel)
-        return responses
-
-    def test_stream_carries_the_zmq_sequence_numbers(self):
-        # Rank 2 publishes on the configured port + 2.
-        endpoint = f"tcp://*:{get_free_port() - 2}"
+        port = get_free_port()
         publisher = EventPublisherFactory.create(
-            json.dumps({"publisher": "zmq", "endpoint": endpoint}),
-            attn_dp_rank=2,
+            json.dumps({"publisher": "zmq", "endpoint": f"tcp://*:{port}"}),
             local_relay=True,
         )
         atexit.unregister(publisher.shutdown)
         self.addCleanup(publisher.shutdown)
-        server = _rust_server(
-            self.ext, self.grpc_port, publisher.describe_local_relay(16)
-        )
-        self.addCleanup(server.shutdown)
-        published = 0
-
-        def publish():
-            nonlocal published
-            publisher.publish(KVEventBatch(ts=2.5, events=[AllBlocksCleared()]))
-            published += 1
-
-        with zmq.Context() as context, context.socket(zmq.SUB) as subscriber:
+        relay = publisher.describe_local_relay(16)
+        self.assertEqual((relay["dp_rank"], relay["block_size"]), (0, 16))
+        context = zmq.Context.instance()
+        subscribers = []
+        for endpoint in (f"tcp://127.0.0.1:{port}", relay["endpoint"]):
+            subscriber = context.socket(zmq.SUB)
+            self.addCleanup(subscriber.close, linger=0)
             subscriber.setsockopt_string(zmq.SUBSCRIBE, "")
-            subscriber.setsockopt(zmq.RCVTIMEO, 5000)
-            subscriber.connect(publisher.describe_local_source(16)["endpoint"])
-            # A SUB socket misses what is published before it joins.
-            for _ in range(100):
-                publish()
-                if subscriber.poll(50):
-                    break
-            live = self._subscribe()
-            self.assertEqual(next(live).start.data_parallel_rank, 2)
-            for _ in range(5):
-                publish()
-            last = published - 1
-            zmq_numbers = [-1]
-            while zmq_numbers[-1] < last:
-                zmq_numbers.append(
-                    int.from_bytes(subscriber.recv_multipart()[1], "big")
-                )
+            subscriber.connect(endpoint)
+            subscribers.append(subscriber)
+        batch = KVEventBatch(ts=1.0, events=[AllBlocksCleared()])
+        # A SUB socket misses what is published before it joins.
+        for _ in range(100):
+            publisher.publish(batch)
+            if all(subscriber.poll(50) for subscriber in subscribers):
+                break
+        for _ in range(3):
+            publisher.publish(batch)
+        publisher._event_queue.join()
+        received = []
+        for subscriber in subscribers:
+            received.append([])
+            while subscriber.poll(200):
+                received[-1].append(subscriber.recv_multipart())
+        configured, private = received
+        self.assertEqual(len(configured[-4:]), 4)
+        self.assertEqual(private[-4:], configured[-4:])
+        last = int.from_bytes(configured[-1][1], "big")
 
-        grpc_batches = [next(live).batch]
-        while grpc_batches[-1].sequence_number < last:
-            grpc_batches.append(next(live).batch)
-        grpc_numbers = [batch.sequence_number for batch in grpc_batches]
-        # Each number once and in order, the last five as on ZMQ.
-        self.assertEqual(grpc_numbers, list(range(grpc_numbers[0], last + 1)))
-        self.assertEqual(grpc_numbers[-5:], zmq_numbers[-5:])
+        # No replay endpoint is configured: the private one still answers.
+        dealer = context.socket(zmq.DEALER)
+        self.addCleanup(dealer.close, linger=0)
+        dealer.setsockopt(zmq.RCVTIMEO, 5000)
+        dealer.connect(relay["replay_endpoint"])
+        dealer.send_multipart([b"", (0).to_bytes(8, "big")])
+        replayed = [dealer.recv_multipart()[1:] for _ in range(last + 2)]
+        self.assertEqual(replayed[-5:-1], configured[-4:])
         self.assertEqual(
-            {(batch.ts, batch.data_parallel_rank) for batch in grpc_batches}, {(2.5, 2)}
+            [int.from_bytes(seq, "big", signed=True) for _, seq, _ in replayed],
+            [*range(last + 1), -1],
         )
 
-        # From the publisher's replay buffer.
-        resumed = self._subscribe(resume=0)
-        next(resumed)
-        self.assertEqual(
-            [next(resumed).batch.sequence_number for _ in range(published)],
-            list(range(published)),
-        )
-
-    def test_kv_events_off_advertise_and_serve_no_stream(self):
-        for config in (None, json.dumps({"publisher": "null"})):
-            publisher = EventPublisherFactory.create(config, local_relay=True)
-            self.assertIsNone(publisher.describe_local_relay(16))
-        server = _rust_server(self.ext, self.grpc_port, None)
-        self.addCleanup(server.shutdown)
-        with self.assertRaises(grpc.RpcError) as error:
-            next(self._subscribe())
-        self.assertEqual(error.exception.code(), grpc.StatusCode.FAILED_PRECONDITION)
+        self.doCleanups()
+        self.assertFalse(os.path.exists(relay["endpoint"][len("ipc://") :]))
 
 
 if __name__ == "__main__":

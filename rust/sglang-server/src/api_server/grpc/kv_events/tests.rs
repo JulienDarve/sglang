@@ -1,356 +1,308 @@
-use std::collections::VecDeque;
+use std::collections::BTreeMap;
 use std::path::PathBuf;
+use std::sync::Mutex;
 use std::time::Duration;
 
 use bytes::Bytes;
 use futures::StreamExt;
-use tokio::sync::mpsc;
-use zeromq::{PubSocket, RouterSocket, Socket, SocketRecv, SocketSend, ZmqMessage};
+use zeromq::{PubSocket, RouterSocket, Socket, SocketRecv, SocketSend};
 
 use super::*;
 use crate::message::config::KvEventRelayConfig;
 
 const TIMEOUT: Duration = Duration::from_secs(5);
 
-enum Command {
-    /// `live: false` keeps the batch for replay only, as a PUB drop does.
-    Publish {
-        live: bool,
-    },
-    HoldReplays,
-    ReleaseReplays,
-}
+type Responses = ResponseStream<pb::SubscribeKvEventsResponse>;
 
-/// `ZmqEventPublisher`'s PUB socket, replay buffer and ROUTER replay protocol.
+/// Stand-in for `ZmqEventPublisher`: its PUB socket and ROUTER replay
+/// protocol, with whatever sequence numbers a test asks for.
 struct Publisher {
     dir: PathBuf,
-    commands: mpsc::UnboundedSender<Command>,
-    /// Each replay request put on hold.
-    held: mpsc::UnboundedReceiver<()>,
-    published: u64,
-    task: tokio::task::JoinHandle<()>,
+    config: KvEventRelayConfig,
+    events: PubSocket,
+    /// The batches served on the replay socket.
+    buffer: Arc<Mutex<BTreeMap<u64, Bytes>>>,
+    replays: tokio::task::JoinHandle<()>,
 }
 
 impl Publisher {
-    async fn bind(buffer_steps: usize) -> Self {
+    async fn bind() -> Self {
         let dir = std::env::temp_dir().join(format!("kv-events-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir(&dir).unwrap();
-        let mut live = PubSocket::new();
-        live.bind(&format!("ipc://{}/events", dir.display()))
-            .await
-            .unwrap();
-        let mut replay = RouterSocket::new();
-        replay
-            .bind(&format!("ipc://{}/replay", dir.display()))
-            .await
-            .unwrap();
-        let (commands, mut command_rx) = mpsc::unbounded_channel();
-        let (held_tx, held) = mpsc::unbounded_channel();
-        let task = tokio::spawn(async move {
-            let mut buffer = VecDeque::<(u64, Bytes)>::new();
-            let mut next = 0u64;
-            let mut hold = false;
-            let mut held_requests = Vec::new();
-            loop {
-                tokio::select! {
-                    command = command_rx.recv() => match command.unwrap() {
-                        Command::Publish { live: on_pub } => {
-                            let payload = Bytes::from(
-                                rmp_serde::to_vec(&(0.5f64, Vec::<()>::new(), Some(0u32))).unwrap(),
-                            );
-                            let seq = Bytes::copy_from_slice(&next.to_be_bytes());
-                            if on_pub {
-                                let frames = vec![Bytes::new(), seq, payload.clone()];
-                                live.send(ZmqMessage::try_from(frames).unwrap()).await.unwrap();
-                            }
-                            buffer.push_back((next, payload));
-                            if buffer.len() > buffer_steps {
-                                buffer.pop_front();
-                            }
-                            next += 1;
-                        }
-                        Command::HoldReplays => hold = true,
-                        Command::ReleaseReplays => {
-                            hold = false;
-                            for request in std::mem::take(&mut held_requests) {
-                                answer(&mut replay, &buffer, request).await;
-                            }
-                        }
-                    },
-                    request = replay.recv() => {
-                        let request = request.unwrap();
-                        if hold {
-                            held_requests.push(request);
-                            held_tx.send(()).unwrap();
-                        } else {
-                            answer(&mut replay, &buffer, request).await;
-                        }
-                    }
-                }
-            }
-        });
-        Self {
-            dir,
-            commands,
-            held,
-            published: 0,
-            task,
-        }
-    }
-
-    fn config(&self) -> KvEventRelayConfig {
-        KvEventRelayConfig {
+        let config = KvEventRelayConfig {
             dp_rank: 0,
             block_size: 16,
-            endpoint: format!("ipc://{}/events", self.dir.display()),
-            replay_endpoint: format!("ipc://{}/replay", self.dir.display()),
+            endpoint: format!("ipc://{}/events", dir.display()),
+            replay_endpoint: format!("ipc://{}/replay", dir.display()),
+        };
+        let mut events = PubSocket::new();
+        events.bind(&config.endpoint).await.unwrap();
+        let mut replay = RouterSocket::new();
+        replay.bind(&config.replay_endpoint).await.unwrap();
+        let buffer = Arc::new(Mutex::new(BTreeMap::new()));
+        let replays = tokio::spawn(serve_replays(replay, buffer.clone()));
+        Self {
+            dir,
+            config,
+            events,
+            buffer,
+            replays,
         }
     }
 
-    fn publish(&mut self, count: u64) {
-        for _ in 0..count {
-            self.commands.send(Command::Publish { live: true }).unwrap();
-        }
-        self.published += count;
+    /// Buffer a batch without publishing it, as when the PUB socket drops it.
+    fn buffer(&self, sequence_number: u64, payload: Bytes) {
+        self.buffer.lock().unwrap().insert(sequence_number, payload);
     }
 
-    fn drop_on_pub(&mut self) {
-        self.commands
-            .send(Command::Publish { live: false })
-            .unwrap();
-        self.published += 1;
+    async fn publish(&mut self, sequence_number: u64, payload: Bytes) {
+        self.buffer(sequence_number, payload.clone());
+        let frames = frames(sequence_number, payload);
+        self.events.send(frames.try_into().unwrap()).await.unwrap();
     }
 
-    fn hold_replays(&self) {
-        self.commands.send(Command::HoldReplays).unwrap();
-    }
-
-    fn release_replays(&self) {
-        self.commands.send(Command::ReleaseReplays).unwrap();
-    }
-
-    /// Publish until the relay has every batch: a PUB socket drops what it
-    /// sends before the subscription reaches it.
-    async fn warm_up(&mut self, relay: &KvEventRelay) {
-        tokio::time::timeout(TIMEOUT, async {
-            while relay.forwarded_next() < self.published || self.published == 0 {
-                self.publish(1);
-                tokio::time::sleep(Duration::from_millis(20)).await;
-            }
-        })
-        .await
-        .expect("the relay never received a batch");
-    }
-
-    async fn wait_relayed(&self, relay: &KvEventRelay) {
-        tokio::time::timeout(TIMEOUT, async {
-            while relay.forwarded_next() < self.published {
-                tokio::time::sleep(Duration::from_millis(5)).await;
-            }
-        })
-        .await
-        .expect("the relay did not receive every batch");
+    /// Drop the buffered batches before `sequence_number`, as a full buffer does.
+    fn forget_before(&self, sequence_number: u64) {
+        let mut buffer = self.buffer.lock().unwrap();
+        *buffer = buffer.split_off(&sequence_number);
     }
 }
 
 impl Drop for Publisher {
     fn drop(&mut self) {
-        self.task.abort();
+        self.replays.abort();
         let _ = std::fs::remove_dir_all(&self.dir);
     }
 }
 
-/// `[identity, "", start]`: every buffered batch from `start` on, then the end.
-async fn answer(replay: &mut RouterSocket, buffer: &VecDeque<(u64, Bytes)>, request: ZmqMessage) {
-    let frames = request.into_vec();
-    let identity = frames[0].clone();
-    let start = u64::from_be_bytes(frames[2].as_ref().try_into().unwrap());
-    let reply = |seq: Bytes, payload: Bytes| {
-        ZmqMessage::try_from(vec![
-            identity.clone(),
-            Bytes::new(),
-            Bytes::new(),
-            seq,
-            payload,
-        ])
-        .unwrap()
-    };
-    for (seq, payload) in buffer.iter().filter(|(seq, _)| *seq >= start) {
-        let seq = Bytes::copy_from_slice(&seq.to_be_bytes());
-        replay.send(reply(seq, payload.clone())).await.unwrap();
+/// `[topic, sequence number, payload]`, as `ZmqEventPublisher` sends a batch.
+fn frames(sequence_number: u64, payload: Bytes) -> Vec<Bytes> {
+    let sequence_number = Bytes::copy_from_slice(&sequence_number.to_be_bytes());
+    vec![Bytes::new(), sequence_number, payload]
+}
+
+/// Answer each `[client, "", start]` with the buffered batches from `start`
+/// on, then the end marker.
+async fn serve_replays(mut socket: RouterSocket, buffer: Arc<Mutex<BTreeMap<u64, Bytes>>>) {
+    while let Ok(request) = socket.recv().await {
+        let request = request.into_vec();
+        let start = u64::from_be_bytes(request[2].as_ref().try_into().unwrap());
+        let mut replies: Vec<(u64, Bytes)> = (buffer.lock().unwrap().range(start..))
+            .map(|(sequence_number, payload)| (*sequence_number, payload.clone()))
+            .collect();
+        replies.push((u64::MAX, Bytes::new()));
+        for (sequence_number, payload) in replies {
+            let mut reply = vec![request[0].clone(), Bytes::new()];
+            reply.extend(frames(sequence_number, payload));
+            socket.send(reply.try_into().unwrap()).await.unwrap();
+        }
     }
-    let end = Bytes::copy_from_slice(&(-1i64).to_be_bytes());
-    replay.send(reply(end, Bytes::new())).await.unwrap();
 }
 
-fn service(relay: &Arc<KvEventRelay>) -> (KvEventsService, watch::Sender<bool>) {
+/// The service over a relay of `publisher`; streams end when the sender drops.
+fn service(publisher: &Publisher) -> (KvEventsService, watch::Sender<bool>) {
     let (stop, stopped) = watch::channel(false);
-    (KvEventsService::new(Some(relay.clone()), stopped), stop)
+    let relay = KvEventRelay::start(&publisher.config);
+    (KvEventsService::new(Some(relay), stopped), stop)
 }
 
+/// Subscribe to rank 0, from `resume = (stream ID, next sequence number)`
+/// when given. Returns the stream's ID and its batches.
 async fn subscribe(
     service: &KvEventsService,
-    resume: Option<pb::KvEventCursor>,
-) -> Result<ResponseStream<pb::SubscribeKvEventsResponse>, Status> {
+    resume: Option<(&str, u64)>,
+) -> Result<(String, Responses), Status> {
     let request = pb::SubscribeKvEventsRequest {
         data_parallel_rank: 0,
-        resume,
+        resume: resume.map(|(stream_id, next_sequence_number)| pb::KvEventCursor {
+            stream_id: stream_id.to_owned(),
+            next_sequence_number,
+        }),
     };
-    Ok(service
-        .subscribe_kv_events(Request::new(request))
-        .await?
-        .into_inner())
+    let response = service.subscribe_kv_events(Request::new(request)).await?;
+    let mut stream = response.into_inner();
+    match stream.next().await.expect("the start item")?.item {
+        Some(Item::Start(start)) => Ok((start.stream_id, stream)),
+        other => panic!("expected the start item, got {other:?}"),
+    }
 }
 
-fn cursor(stream_id: &str, next_sequence_number: u64) -> Option<pb::KvEventCursor> {
-    Some(pb::KvEventCursor {
-        stream_id: stream_id.to_owned(),
-        next_sequence_number,
-    })
-}
-
-async fn next_item(
-    stream: &mut ResponseStream<pb::SubscribeKvEventsResponse>,
-) -> Result<Item, Status> {
+async fn next_batch(stream: &mut Responses) -> Result<pb::KvEventBatch, Status> {
     let response = tokio::time::timeout(TIMEOUT, stream.next())
         .await
-        .expect("no response in time")
+        .expect("no batch in time")
         .expect("the stream ended")?;
-    Ok(response.item.unwrap())
-}
-
-async fn start(stream: &mut ResponseStream<pb::SubscribeKvEventsResponse>) -> String {
-    match next_item(stream).await.unwrap() {
-        Item::Start(start) => start.stream_id,
-        Item::Batch(batch) => panic!("batch {} before start", batch.sequence_number),
+    match response.item {
+        Some(Item::Batch(batch)) => Ok(batch),
+        other => panic!("expected a batch, got {other:?}"),
     }
 }
 
-async fn sequence_numbers(
-    stream: &mut ResponseStream<pb::SubscribeKvEventsResponse>,
-    count: u64,
-) -> Vec<u64> {
-    let mut received = Vec::new();
-    for _ in 0..count {
-        match next_item(stream).await.unwrap() {
-            Item::Batch(batch) => received.push(batch.sequence_number),
-            Item::Start(_) => panic!("a second start"),
+/// `[ts, events, attn_dp_rank]` with no events.
+fn empty_batch() -> Bytes {
+    rmp_serde::to_vec(&(0.5, [(); 0], 0)).unwrap().into()
+}
+
+/// Publish an empty batch until `stream` yields it. A PUB socket drops what
+/// it sends before the subscription reaches it, and readers skip the repeats.
+async fn publish_until_received(
+    publisher: &mut Publisher,
+    sequence_number: u64,
+    stream: &mut Responses,
+) -> pb::KvEventBatch {
+    let received = async {
+        loop {
+            publisher.publish(sequence_number, empty_batch()).await;
+            let batch = tokio::time::timeout(Duration::from_millis(20), stream.next());
+            if let Ok(Some(Ok(response))) = batch.await {
+                return response.item;
+            }
         }
-    }
-    received
-}
-
-#[tokio::test]
-async fn resume_inside_the_buffer_delivers_each_batch_once() {
-    let mut publisher = Publisher::bind(100).await;
-    let relay = KvEventRelay::start(&publisher.config());
-    let (service, _stop) = service(&relay);
-    publisher.warm_up(&relay).await;
-    publisher.publish(3);
-    publisher.wait_relayed(&relay).await;
-
-    publisher.hold_replays();
-    let subscription = tokio::spawn(async move {
-        let stream = subscribe(&service, cursor("", 1)).await;
-        (service, stream)
-    });
-    publisher.held.recv().await.unwrap();
-    // Published after the subscriber joined and before the replay is
-    // answered: both in the replay and live.
-    publisher.publish(2);
-    publisher.wait_relayed(&relay).await;
-    publisher.release_replays();
-    let (_service, stream) = subscription.await.unwrap();
-    let mut stream = stream.unwrap();
-    // Only live.
-    publisher.publish(2);
-
-    assert!(!start(&mut stream).await.is_empty());
-    let last = publisher.published - 1;
-    assert_eq!(
-        sequence_numbers(&mut stream, last).await,
-        (1..=last).collect::<Vec<_>>()
-    );
-}
-
-#[tokio::test]
-async fn cursor_outside_the_buffer_or_stream_is_out_of_range() {
-    for buffer_steps in [4, 0] {
-        let mut publisher = Publisher::bind(buffer_steps).await;
-        let relay = KvEventRelay::start(&publisher.config());
-        let (service, _stop) = service(&relay);
-        publisher.warm_up(&relay).await;
-        publisher.publish(6);
-        publisher.wait_relayed(&relay).await;
-
-        let stream_id = relay.stream_id().to_owned();
-        let last = publisher.published - 1;
-        // An empty buffer holds not even the last batch.
-        let old = if buffer_steps == 0 { last } else { 0 };
-        for (resume, reason) in [
-            (cursor(&stream_id, old), "older than the buffer"),
-            (cursor("stale", last), "another stream"),
-        ] {
-            let status = subscribe(&service, resume).await.err().expect(reason);
-            assert_eq!(
-                status.code(),
-                tonic::Code::OutOfRange,
-                "buffer {buffer_steps}, {reason}: {status}"
-            );
-        }
+    };
+    match tokio::time::timeout(TIMEOUT, received).await {
+        Ok(Some(Item::Batch(batch))) => batch,
+        other => panic!("expected batch {sequence_number}, got {other:?}"),
     }
 }
 
+/// A batch with every event type and field: the bytes `ZmqEventPublisher`
+/// sends for it (`testdata/kv_event_batch.hex`, which `test_kv_events.py`
+/// compares with msgspec's encoding), and the message the stream carries.
+fn batch_with_every_field() -> (Bytes, pb::KvEventBatch) {
+    use pb::block_token_ids::Ids;
+    use pb::kv_cache_event::Event;
+
+    let payload = include_str!("../../../../testdata/kv_event_batch.hex").trim();
+    let payload: Vec<u8> = (0..payload.len())
+        .step_by(2)
+        .map(|i| u8::from_str_radix(&payload[i..i + 2], 16).unwrap())
+        .collect();
+
+    let hash = |value| pb::BlockHash {
+        value: Some(pb::block_hash::Value::SignedValue(value)),
+    };
+    let token_ids = |ids| Some(pb::BlockTokenIds { ids: Some(ids) });
+    let image = pb::MmRoutingSpan {
+        start: 0,
+        length: 1,
+        label: "image".into(),
+    };
+    let events = vec![
+        Event::BlockStored(pb::BlockStored {
+            block_hashes: vec![hash(-7), hash(1 << 62)],
+            parent_block_hash: Some(hash(-1)),
+            token_ids: token_ids(Ids::Single(pb::TokenIdList {
+                token_ids: vec![1, 2, 1 << 40, 3],
+            })),
+            block_size: 2,
+            lora_id: Some(5),
+            medium: Some("CPU_PINNED".into()),
+            lora_name: Some("adapter".into()),
+            session_id: Some("session".into()),
+            cache_salt: Some("salt".into()),
+            mm_routing_spans: vec![
+                pb::BlockMmRoutingSpans { spans: vec![image] },
+                pb::BlockMmRoutingSpans { spans: vec![] },
+            ],
+            ..Default::default()
+        }),
+        // An EAGLE page: `[token, next token]` pairs, and no parent.
+        Event::BlockStored(pb::BlockStored {
+            block_hashes: vec![hash(11)],
+            token_ids: token_ids(Ids::Pairs(pb::TokenIdPairList {
+                pairs: [(1, 2), (2, 3)]
+                    .map(|(first, second)| pb::TokenIdPair { first, second })
+                    .into(),
+            })),
+            block_size: 2,
+            ..Default::default()
+        }),
+        Event::BlockRemoved(pb::BlockRemoved {
+            block_hashes: vec![hash(-7)],
+            medium: Some("GPU".into()),
+            ..Default::default()
+        }),
+        Event::AllBlocksCleared(pb::AllBlocksCleared {}),
+    ];
+    let streamed = pb::KvEventBatch {
+        sequence_number: 0,
+        ts: 1.5,
+        data_parallel_rank: Some(3),
+        events: events
+            .into_iter()
+            .map(|event| pb::KvCacheEvent { event: Some(event) })
+            .collect(),
+    };
+    (payload.into(), streamed)
+}
+
+async fn assert_refused(service: &KvEventsService, resume: (&str, u64), code: tonic::Code) {
+    let status = subscribe(service, Some(resume))
+        .await
+        .err()
+        .expect("a status");
+    assert_eq!(status.code(), code, "{resume:?}: {status}");
+}
+
 #[tokio::test]
-async fn slow_subscriber_is_caught_up_until_the_buffer_no_longer_covers_it() {
-    let mut publisher = Publisher::bind(8).await;
-    let relay = KvEventRelay::start_with_capacity(&publisher.config(), 2);
-    let (service, _stop) = service(&relay);
-    publisher.warm_up(&relay).await;
-    let mut stream = subscribe(&service, None).await.unwrap();
-    start(&mut stream).await;
+async fn resume_replays_the_buffer_then_continues_live() {
+    let mut publisher = Publisher::bind().await;
+    // Published before anyone subscribed.
+    let (payload, every_field) = batch_with_every_field();
+    publisher.buffer(0, payload);
+    let (service, _stop) = service(&publisher);
 
-    // More than the live fan-out keeps, fewer than the replay buffer.
-    let first = publisher.published;
-    publisher.publish(6);
-    publisher.wait_relayed(&relay).await;
-    assert_eq!(
-        sequence_numbers(&mut stream, 6).await,
-        (first..first + 6).collect::<Vec<_>>()
-    );
+    // Without a cursor, the stream starts live.
+    let (stream_id, mut live) = subscribe(&service, None).await.unwrap();
+    let first_live = publish_until_received(&mut publisher, 1, &mut live).await;
+    assert_eq!(first_live.sequence_number, 1);
 
-    // More than the replay buffer.
-    publisher.publish(12);
-    publisher.wait_relayed(&relay).await;
-    let status = next_item(&mut stream).await.expect_err("data loss");
+    // A cursor replays the publisher's buffer, then continues live.
+    let (_, mut resumed) = subscribe(&service, Some((&stream_id, 0))).await.unwrap();
+    assert_eq!(next_batch(&mut resumed).await.unwrap(), every_field);
+    assert_eq!(next_batch(&mut resumed).await.unwrap(), first_live);
+    // Batch 1 again: a batch published during a replay arrives live too.
+    publisher.publish(1, empty_batch()).await;
+    publisher.publish(2, empty_batch()).await;
+    for stream in [&mut resumed, &mut live] {
+        assert_eq!(next_batch(stream).await.unwrap().sequence_number, 2);
+    }
+
+    // A cursor of another stream, older than the buffer, or with an empty
+    // buffer (`buffer_steps: 0`) is refused.
+    assert_refused(&service, ("another-stream", 2), tonic::Code::OutOfRange).await;
+    publisher.forget_before(1);
+    assert_refused(&service, ("", 0), tonic::Code::OutOfRange).await;
+    publisher.forget_before(u64::MAX);
+    assert_refused(&service, ("", 2), tonic::Code::OutOfRange).await;
+}
+
+#[tokio::test]
+async fn gap_is_filled_from_the_buffer_or_ends_the_stream() {
+    let mut publisher = Publisher::bind().await;
+    let (service, _stop) = service(&publisher);
+    let (_, mut stream) = subscribe(&service, None).await.unwrap();
+    publish_until_received(&mut publisher, 0, &mut stream).await;
+
+    // The PUB socket dropped batch 1, which is still buffered.
+    publisher.buffer(1, empty_batch());
+    publisher.publish(2, empty_batch()).await;
+    for sequence_number in [1, 2] {
+        let batch = next_batch(&mut stream).await.unwrap();
+        assert_eq!(batch.sequence_number, sequence_number);
+    }
+
+    // The publisher skipped batch 3: live and resumed readers both learn of it.
+    publisher.publish(4, empty_batch()).await;
+    let status = next_batch(&mut stream).await.unwrap_err();
     assert_eq!(status.code(), tonic::Code::DataLoss, "{status}");
+    assert_refused(&service, ("", 2), tonic::Code::OutOfRange).await;
 }
 
 #[tokio::test]
-async fn batch_the_pub_socket_dropped_is_filled_from_the_replay_buffer() {
-    let mut publisher = Publisher::bind(100).await;
-    let relay = KvEventRelay::start(&publisher.config());
-    let (service, _stop) = service(&relay);
-    publisher.warm_up(&relay).await;
-    let mut stream = subscribe(&service, None).await.unwrap();
-    start(&mut stream).await;
-
-    let first = publisher.published;
-    publisher.drop_on_pub();
-    publisher.publish(1);
-    assert_eq!(sequence_numbers(&mut stream, 2).await, [first, first + 1]);
-}
-
-#[tokio::test]
-async fn streams_end_at_shutdown() {
-    let mut publisher = Publisher::bind(100).await;
-    let relay = KvEventRelay::start(&publisher.config());
-    let (service, stop) = service(&relay);
-    publisher.warm_up(&relay).await;
-    let mut stream = subscribe(&service, None).await.unwrap();
-    start(&mut stream).await;
-
-    stop.send(true).unwrap();
-    let status = next_item(&mut stream).await.expect_err("shutdown");
-    assert_eq!(status.code(), tonic::Code::Unavailable, "{status}");
+async fn kv_events_off_is_a_failed_precondition() {
+    let (_stop, stopped) = watch::channel(false);
+    let service = KvEventsService::new(None, stopped);
+    let status = subscribe(&service, None).await.err().expect("a status");
+    assert_eq!(status.code(), tonic::Code::FailedPrecondition, "{status}");
 }

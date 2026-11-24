@@ -23,7 +23,6 @@ from sglang.srt.rust_server import server as server_module
 from sglang.srt.rust_server.config import request_log_settings
 from sglang.srt.rust_server.server import RustServer
 from sglang.test.ci.ci_register import register_cuda_ci
-from sglang.test.rust_server_args import standalone_server_args
 from sglang.test.test_utils import CustomTestCase, is_rust_server_built
 
 # Where the Rust server extension is built; the test needs no GPU.
@@ -37,11 +36,77 @@ def _free_port() -> int:
 
 
 def _server_args(ext, port: int):
-    return standalone_server_args(
-        ext,
+    return ext.ServerArgs(
+        model_path="rust-server-test",
+        served_model_name="rust-server-test",
+        tokenizer_path="",
+        public_tokenizer_path="",
+        revision=None,
+        load_format=None,
+        weight_version=None,
+        hicache_storage_backend=None,
+        hicache_storage_backend_extra_config=None,
+        hicache_storage_prefetch_policy=None,
+        hicache_write_policy=None,
+        host="127.0.0.1",
         port=port,
+        http2=None,
+        grpc_port=None,
+        grpc_response_timeout_secs=300,
+        api_key=None,
+        admin_api_key=None,
+        log_level="warning",
+        log_level_http=None,
+        chat_template=None,
+        default_chat_template_kwargs="{}",
+        tool_call_parser=None,
+        reasoning_parser=None,
+        stream_response_default_include_usage=False,
+        enable_cache_report=False,
+        tokenizer_worker_num=1,
+        detokenizer_worker_num=1,
+        skip_tokenizer_init=True,
+        skip_server_warmup=True,
+        gc_threshold=None,
+        custom_warmups_pending=False,
+        default_priority_value=None,
+        enable_request_header_overrides=False,
+        enable_request_decompression=False,
+        health_generate_headers={},
+        incremental_streaming_output=False,
+        disaggregation_mode=ext.DisaggregationMode.Null,
+        model_config=ext.ModelConfig(
+            context_len=100000,
+            vocab_size=1000,
+            is_multimodal=False,
+            default_sampling_params=ext.DefaultSamplingParams(),
+            model_type=None,
+            architectures=None,
+        ),
+        preferred_sampling_params=None,
+        default_max_new_tokens=128,
+        lora_ids={},
+        enable_strict_thinking=False,
+        limit_mm_data_per_request=[],
+        allow_auto_truncate=False,
+        enable_return_hidden_states=False,
+        return_hidden_states_mode=None,
+        num_reserved_tokens=0,
+        tokenizer_model_max_length=-1,
+        version="test",
+        max_total_num_tokens=100000,
+        deployment_info="{}",
+        launch_server_info="{}",
+        launch_model_info="{}",
+        load_snapshot_path=None,
+        load_snapshot_dp_size=0,
+        load_snapshot_dp_rank=0,
+        accelerator=None,
+        num_accelerators=0,
+        metrics=None,
         request_log=ext.RequestLogConfig(**request_log_settings(1, GenerateReqInput)),
         crash_dump=True,
+        server_added_custom_params=[],
     )
 
 
