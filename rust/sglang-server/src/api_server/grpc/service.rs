@@ -2266,64 +2266,76 @@ mod tests {
         assert_eq!(info.num_reserved_tokens, 4);
     }
 
-    /// Sidecars pick a KV event source by its transport.
+    /// Sidecars pick a KV event source by its transport; the gRPC one is this
+    /// server's stream, listed only when the listener relays one.
     #[tokio::test]
-    async fn server_info_labels_kv_event_sources_with_their_transport() {
-        use crate::message::config::{DeploymentInfo, KvEventSource};
+    async fn server_info_lists_kv_event_sources_by_transport() {
+        use crate::message::config::{DeploymentInfo, KvEventRelayConfig, KvEventSource};
 
-        let source = |endpoint: &str| KvEventSource {
-            dp_rank: 1,
-            endpoint: endpoint.into(),
-            topic: String::new(),
-            block_size: 16,
-        };
-        let Harness {
-            service,
-            intake_rx,
-            abort_rx: _,
-        } = Harness::build(
-            1,
-            false,
-            Duration::from_secs(1),
-            true,
-            None,
-            ServerArgs {
-                deployment_info: DeploymentInfo {
-                    kv_event_sources: vec![source("tcp://127.0.0.1:5558")],
-                    grpc_kv_event_sources: vec![source("")],
-                    ..Default::default()
+        for relayed in [false, true] {
+            let Harness {
+                service,
+                intake_rx,
+                abort_rx: _,
+            } = Harness::build(
+                1,
+                false,
+                Duration::from_secs(1),
+                true,
+                None,
+                ServerArgs {
+                    deployment_info: DeploymentInfo {
+                        kv_event_sources: vec![KvEventSource {
+                            dp_rank: 1,
+                            endpoint: "tcp://127.0.0.1:5558".into(),
+                            topic: String::new(),
+                            block_size: 16,
+                        }],
+                        kv_event_relay: relayed.then(|| KvEventRelayConfig {
+                            dp_rank: 1,
+                            block_size: 16,
+                            endpoint: "ipc:///kv/events".into(),
+                            replay_endpoint: "ipc:///kv/replay".into(),
+                        }),
+                        ..Default::default()
+                    },
+                    ..test_server_args()
                 },
-                ..test_server_args()
-            },
-        );
-        let call = service.get_server_info(Request::new(api::GetServerInfoRequest {}));
-        let scheduler = async {
-            let TmEvent::Intake {
-                request: control,
-                admission,
-            } = intake_rx.recv_async().await.unwrap()
-            else {
-                panic!("server info must submit one control request");
+            );
+            let call = service.get_server_info(Request::new(api::GetServerInfoRequest {}));
+            let scheduler = async {
+                let TmEvent::Intake {
+                    request: control,
+                    admission,
+                } = intake_rx.recv_async().await.unwrap()
+                else {
+                    panic!("server info must submit one control request");
+                };
+                assert!(admission.try_accept());
+                let envelope = rmpv::Value::Map(vec![(
+                    rmpv::Value::from("internal_state"),
+                    rmpv::Value::Map(Vec::new()),
+                )]);
+                let mut payload = Vec::new();
+                rmpv::encode::write_value(&mut payload, &envelope).unwrap();
+                control
+                    .sink
+                    .try_send(ResponseItem::Control(bytes::Bytes::from(payload)))
+                    .unwrap();
             };
-            assert!(admission.try_accept());
-            let envelope = rmpv::Value::Map(vec![(
-                rmpv::Value::from("internal_state"),
-                rmpv::Value::Map(Vec::new()),
-            )]);
-            let mut payload = Vec::new();
-            rmpv::encode::write_value(&mut payload, &envelope).unwrap();
-            control
-                .sink
-                .try_send(ResponseItem::Control(bytes::Bytes::from(payload)))
-                .unwrap();
-        };
-        let (response, ()) = tokio::join!(call, scheduler);
-        let deployment = response.unwrap().into_inner().deployment_info.unwrap();
-        let transports = |sources: &[api::KvEventSource]| {
-            Vec::from_iter(sources.iter().map(|source| source.transport.clone()))
-        };
-        assert_eq!(transports(&deployment.kv_event_sources), ["zmq"]);
-        assert_eq!(transports(&deployment.grpc_kv_event_sources), ["grpc"]);
+            let (response, ()) = tokio::join!(call, scheduler);
+            let deployment = response.unwrap().into_inner().deployment_info.unwrap();
+            assert_eq!(deployment.kv_event_sources.len(), 1);
+            assert_eq!(deployment.kv_event_sources[0].transport, "zmq");
+            let grpc = relayed.then(|| api::KvEventSource {
+                dp_rank: 1,
+                endpoint: String::new(),
+                topic: String::new(),
+                block_size: 16,
+                transport: "grpc".into(),
+            });
+            assert_eq!(deployment.grpc_kv_event_sources, Vec::from_iter(grpc));
+        }
     }
 
     /// gRPC `GetServerInfo` advertises the same nonempty owning-runtime id on

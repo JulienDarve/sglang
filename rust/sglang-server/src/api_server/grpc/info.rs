@@ -125,14 +125,15 @@ pub(super) fn server_info(info: ServerInfo) -> Result<api::GetServerInfoResponse
                     transport: "zmq".to_owned(),
                 })
                 .collect(),
+            // The relayed stream; an empty endpoint is this gRPC server.
             grpc_kv_event_sources: deployment_info
-                .grpc_kv_event_sources
+                .kv_event_relay
                 .into_iter()
-                .map(|source| api::KvEventSource {
-                    dp_rank: source.dp_rank,
-                    endpoint: source.endpoint,
-                    topic: source.topic,
-                    block_size: source.block_size,
+                .map(|relay| api::KvEventSource {
+                    dp_rank: relay.dp_rank,
+                    endpoint: String::new(),
+                    topic: String::new(),
+                    block_size: relay.block_size,
                     transport: "grpc".to_owned(),
                 })
                 .collect(),

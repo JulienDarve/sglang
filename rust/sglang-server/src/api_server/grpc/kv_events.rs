@@ -8,19 +8,18 @@ mod wire;
 
 use std::sync::Arc;
 
-use bytes::Bytes;
 use sglang_kv_types::kv::v1 as pb;
 use sglang_kv_types::kv::v1::kv_events_server::KvEvents;
 use sglang_kv_types::kv::v1::subscribe_kv_events_response::Item;
-use tokio::sync::{broadcast, watch};
+use tokio::sync::watch;
 use tonic::{Request, Response, Status};
 
 pub(crate) use self::relay::KvEventRelay;
-use self::relay::{ReplayError, Subscription};
+use self::relay::{KvEventReader, ReadError};
 use super::service::ResponseStream;
 
 pub(crate) struct KvEventsService {
-    /// `None` when this listener's scheduler publishes no KV events.
+    /// `None` when this listener's scheduler publishes no KV events over ZMQ.
     relay: Option<Arc<KvEventRelay>>,
     /// Turns true to end every stream, which a graceful shutdown would
     /// otherwise wait for.
@@ -44,7 +43,8 @@ impl KvEvents for KvEventsService {
         let request = request.into_inner();
         let relay = self.relay.clone().ok_or_else(|| {
             Status::failed_precondition(
-                "KV cache events are off; enable them with --kv-events-config",
+                "this server's scheduler publishes no KV cache events over ZMQ; enable them \
+                 with --kv-events-config and the zmq publisher",
             )
         })?;
         if request.data_parallel_rank != relay.dp_rank {
@@ -53,124 +53,56 @@ impl KvEvents for KvEventsService {
                 relay.dp_rank, request.data_parallel_rank
             )));
         }
-        let subscription = relay
-            .subscribe()
-            .ok_or_else(|| Status::unavailable("the KV event relay stopped"))?;
-        let mut next = subscription.next;
-        let mut replayed = Vec::new();
-        if let Some(cursor) = request.resume {
-            if !cursor.stream_id.is_empty() && cursor.stream_id != subscription.stream_id {
-                return Err(Status::out_of_range(format!(
-                    "stream {} is not the current KV event stream",
-                    cursor.stream_id
-                )));
-            }
-            if cursor.next_sequence_number < next {
-                replayed = relay
-                    .replay(cursor.next_sequence_number)
-                    .await
-                    .map_err(replay_failed)?;
-                if replayed.first().map(|(first, _)| *first) != Some(cursor.next_sequence_number) {
-                    return Err(Status::out_of_range(format!(
-                        "KV event batch {} is no longer in the engine's replay buffer",
-                        cursor.next_sequence_number
-                    )));
-                }
-            }
-            next = cursor.next_sequence_number;
-        }
+        let reader = relay.reader(request.resume).await.map_err(read_status)?;
         Ok(Response::new(Box::pin(responses(
             relay,
-            subscription,
-            next,
-            replayed,
+            reader,
             self.stop.clone(),
         ))))
     }
 }
 
-/// `start`, the batches from `next` on: first `replayed`, then live ones,
-/// caught up from the engine's replay buffer whenever the subscriber fell
-/// behind.
+/// `start`, then the reader's batches until an error or shutdown.
 fn responses(
     relay: Arc<KvEventRelay>,
-    subscription: Subscription,
-    mut next: u64,
-    replayed: Vec<(u64, Bytes)>,
+    mut reader: KvEventReader,
     mut stop: watch::Receiver<bool>,
 ) -> impl futures::Stream<Item = Result<pb::SubscribeKvEventsResponse, Status>> + Send + 'static {
-    let Subscription {
-        stream_id,
-        mut live,
-        ..
-    } = subscription;
     async_stream::try_stream! {
         yield response(Item::Start(pb::KvEventStreamStart {
-            stream_id,
+            stream_id: relay.stream_id().to_owned(),
             data_parallel_rank: relay.dp_rank,
         }));
-        let replayed = from_next(next, replayed);
-        next += replayed.len() as u64;
-        for (sequence_number, payload) in replayed {
-            yield response(Item::Batch(decode(sequence_number, &payload)?));
-        }
         loop {
-            let received = tokio::select! {
+            let batch = tokio::select! {
                 _ = stop.wait_for(|stop| *stop) => None,
-                received = live.recv() => Some(received),
+                batch = reader.next_batch() => Some(batch),
             };
-            let batch = match received {
-                Some(Ok(batch)) => batch,
-                // The next batch received is ahead, which catches up below.
-                Some(Err(broadcast::error::RecvError::Lagged(_))) => continue,
-                Some(Err(broadcast::error::RecvError::Closed)) => {
-                    Err(Status::unavailable("the KV event relay stopped"))?
-                }
+            let batch = match batch {
+                Some(batch) => batch.map_err(read_status)?,
                 None => Err(Status::unavailable("the server is shutting down"))?,
             };
-            if batch.sequence_number > next {
-                let replayed = from_next(next, relay.replay(next).await.map_err(replay_failed)?);
-                next += replayed.len() as u64;
-                for (sequence_number, payload) in replayed {
-                    yield response(Item::Batch(decode(sequence_number, &payload)?));
-                }
-                if batch.sequence_number > next {
-                    Err(Status::data_loss(format!(
-                        "KV event batch {next} is no longer in the engine's replay buffer"
-                    )))?;
-                }
-            }
-            if batch.sequence_number == next {
-                next += 1;
-                yield response(Item::Batch(Arc::unwrap_or_clone(batch)));
-            }
+            yield response(Item::Batch(Arc::unwrap_or_clone(batch)));
         }
     }
 }
 
-/// The replayed batches from `next` on, up to the first one missing.
-fn from_next(next: u64, replayed: Vec<(u64, Bytes)>) -> Vec<(u64, Bytes)> {
-    replayed
-        .into_iter()
-        .skip_while(|(sequence_number, _)| *sequence_number < next)
-        .zip(next..)
-        .take_while(|((sequence_number, _), expected)| sequence_number == expected)
-        .map(|(batch, _)| batch)
-        .collect()
-}
-
-fn decode(sequence_number: u64, payload: &[u8]) -> Result<pb::KvEventBatch, Status> {
-    wire::decode_batch(sequence_number, payload).map_err(|error| {
-        Status::data_loss(format!(
-            "KV event batch {sequence_number} cannot be decoded: {error}"
-        ))
-    })
+fn read_status(error: ReadError) -> Status {
+    match error {
+        ReadError::OutOfRange => Status::out_of_range(
+            "the cursor's KV event batches are no longer in the engine's replay buffer, or its \
+             stream is not the current one",
+        ),
+        ReadError::DataLoss => Status::data_loss(
+            "KV event batches after the last one sent are no longer in the engine's replay buffer",
+        ),
+        ReadError::ReplayFailed(error) => {
+            Status::unavailable(format!("the engine's KV event replay failed: {error}"))
+        }
+        ReadError::RelayStopped => Status::unavailable("the KV event relay stopped"),
+    }
 }
 
 fn response(item: Item) -> pb::SubscribeKvEventsResponse {
     pb::SubscribeKvEventsResponse { item: Some(item) }
-}
-
-fn replay_failed(error: ReplayError) -> Status {
-    Status::unavailable(format!("KV event replay failed: {error}"))
 }

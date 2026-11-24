@@ -2,6 +2,7 @@ use std::collections::VecDeque;
 use std::path::PathBuf;
 use std::time::Duration;
 
+use bytes::Bytes;
 use futures::StreamExt;
 use tokio::sync::mpsc;
 use zeromq::{PubSocket, RouterSocket, Socket, SocketRecv, SocketSend, ZmqMessage};
@@ -62,10 +63,10 @@ impl Publisher {
                                 let frames = vec![Bytes::new(), seq, payload.clone()];
                                 live.send(ZmqMessage::try_from(frames).unwrap()).await.unwrap();
                             }
-                            if buffer.len() == buffer_steps {
+                            buffer.push_back((next, payload));
+                            if buffer.len() > buffer_steps {
                                 buffer.pop_front();
                             }
-                            buffer.push_back((next, payload));
                             next += 1;
                         }
                         Command::HoldReplays => hold = true,
@@ -132,7 +133,7 @@ impl Publisher {
     /// sends before the subscription reaches it.
     async fn warm_up(&mut self, relay: &KvEventRelay) {
         tokio::time::timeout(TIMEOUT, async {
-            while relay.next() < self.published || self.published == 0 {
+            while relay.forwarded_next() < self.published || self.published == 0 {
                 self.publish(1);
                 tokio::time::sleep(Duration::from_millis(20)).await;
             }
@@ -143,7 +144,7 @@ impl Publisher {
 
     async fn wait_relayed(&self, relay: &KvEventRelay) {
         tokio::time::timeout(TIMEOUT, async {
-            while relay.next() < self.published {
+            while relay.forwarded_next() < self.published {
                 tokio::time::sleep(Duration::from_millis(5)).await;
             }
         })
@@ -274,21 +275,29 @@ async fn resume_inside_the_buffer_delivers_each_batch_once() {
 
 #[tokio::test]
 async fn cursor_outside_the_buffer_or_stream_is_out_of_range() {
-    let mut publisher = Publisher::bind(4).await;
-    let relay = KvEventRelay::start(&publisher.config());
-    let (service, _stop) = service(&relay);
-    publisher.warm_up(&relay).await;
-    publisher.publish(6);
-    publisher.wait_relayed(&relay).await;
+    for buffer_steps in [4, 0] {
+        let mut publisher = Publisher::bind(buffer_steps).await;
+        let relay = KvEventRelay::start(&publisher.config());
+        let (service, _stop) = service(&relay);
+        publisher.warm_up(&relay).await;
+        publisher.publish(6);
+        publisher.wait_relayed(&relay).await;
 
-    let mut current = subscribe(&service, None).await.unwrap();
-    let stream_id = start(&mut current).await;
-    for (resume, reason) in [
-        (cursor(&stream_id, 0), "older than the buffer"),
-        (cursor("stale", publisher.published - 1), "another stream"),
-    ] {
-        let status = subscribe(&service, resume).await.err().expect(reason);
-        assert_eq!(status.code(), tonic::Code::OutOfRange, "{reason}: {status}");
+        let stream_id = relay.stream_id().to_owned();
+        let last = publisher.published - 1;
+        // An empty buffer holds not even the last batch.
+        let old = if buffer_steps == 0 { last } else { 0 };
+        for (resume, reason) in [
+            (cursor(&stream_id, old), "older than the buffer"),
+            (cursor("stale", last), "another stream"),
+        ] {
+            let status = subscribe(&service, resume).await.err().expect(reason);
+            assert_eq!(
+                status.code(),
+                tonic::Code::OutOfRange,
+                "buffer {buffer_steps}, {reason}: {status}"
+            );
+        }
     }
 }
 
@@ -324,13 +333,12 @@ async fn batch_the_pub_socket_dropped_is_filled_from_the_replay_buffer() {
     let (service, _stop) = service(&relay);
     publisher.warm_up(&relay).await;
     let mut stream = subscribe(&service, None).await.unwrap();
-    let stream_id = start(&mut stream).await;
+    start(&mut stream).await;
 
     let first = publisher.published;
     publisher.drop_on_pub();
     publisher.publish(1);
     assert_eq!(sequence_numbers(&mut stream, 2).await, [first, first + 1]);
-    assert_eq!(relay.subscribe().unwrap().stream_id, stream_id);
 }
 
 #[tokio::test]

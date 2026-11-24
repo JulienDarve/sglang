@@ -10,7 +10,6 @@ the router can subscribe per replica (the `dp_size` it reads from
 import atexit
 import importlib
 import json
-import socket
 import threading
 import time
 import unittest
@@ -24,6 +23,7 @@ from sglang.srt.disaggregation.kv_events import (
     AllBlocksCleared,
     BlockRemoved,
     BlockStored,
+    EventBatch,
     EventPublisherFactory,
     KVEventBatch,
     NullEventPublisher,
@@ -38,6 +38,7 @@ from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils.network import get_free_port
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.kv_event_stream import KvEventStream
+from sglang.test.rust_server_args import standalone_server_args
 from sglang.test.test_utils import CustomTestCase, is_rust_server_built
 
 register_cpu_ci(est_time=16, suite="base-a-test-cpu")
@@ -189,6 +190,36 @@ class TestBlockStoredWireFormat(CustomTestCase):
         self.assertIsInstance(round_tripped.events[4], AllBlocksCleared)
 
 
+class TestRustServerDecodedFields(CustomTestCase):
+    def test_event_fields_match_the_rust_server_decoder(self):
+        """The Rust server's KvEvents relay decodes exactly these fields
+        (rust/sglang-server/src/api_server/grpc/kv_events/wire.rs) and drops any
+        other; a new one belongs there and in proto/sglang/kv/v1 too."""
+        self.assertEqual(EventBatch.__struct_fields__, ("ts", "events", "attn_dp_rank"))
+        self.assertEqual(
+            {
+                event.__struct_config__.tag: event.__struct_fields__
+                for event in (BlockStored, BlockRemoved, AllBlocksCleared)
+            },
+            {
+                "BlockStored": (
+                    "block_hashes",
+                    "parent_block_hash",
+                    "token_ids",
+                    "block_size",
+                    "lora_id",
+                    "medium",
+                    "cache_salt",
+                    "session_id",
+                    "lora_name",
+                    "mm_routing_spans",
+                ),
+                "BlockRemoved": ("block_hashes", "medium"),
+                "AllBlocksCleared": (),
+            },
+        )
+
+
 class TestNamespacedBlockHash(CustomTestCase):
     def test_values_are_pinned(self):
         # Rust has its own copy of this function, and its test uses the same
@@ -248,87 +279,61 @@ class TestReplay(CustomTestCase):
             self.assertEqual(batch.attn_dp_rank, 0)
         self.assertEqual(frames[2][3], b"")
 
+    def test_full_replay_reaches_a_reader_that_reads_after_it_is_sent(self):
+        """A replay of the whole buffer keeps every batch and the end marker
+        although the reader takes nothing until the burst is sent, also after
+        earlier replays leave ZMQ's read acknowledgements stale."""
+        steps = 2500
+        replay = f"tcp://127.0.0.1:{get_free_port()}"
+        publisher = ZmqEventPublisher(
+            attn_dp_rank=0,
+            endpoint="inproc://kv-full-replay-test",
+            replay_endpoint=replay,
+            buffer_steps=steps,
+        )
+        atexit.unregister(publisher.shutdown)
+        self.addCleanup(publisher.shutdown)
+        dealer = zmq.Context.instance().socket(zmq.DEALER)
+        self.addCleanup(dealer.close, linger=0)
+        dealer.connect(replay)
+        # About 3 KB each, more than the socket buffers hold in all.
+        stored = BlockStored(
+            block_hashes=[1],
+            parent_block_hash=None,
+            token_ids=list(range(1000)),
+            block_size=1000,
+            lora_id=None,
+        )
+        batch = KVEventBatch(ts=1.0, events=[stored])
+        for _ in range(steps):
+            publisher.publish(batch)
+        publisher._event_queue.join()
 
-def _free_port() -> int:
-    with socket.socket() as s:
-        s.bind(("127.0.0.1", 0))
-        return s.getsockname()[1]
+        for first in range(4):
+            dealer.send_multipart([b"", (0).to_bytes(8, "big")])
+            self.assertTrue(dealer.poll(5000), "the replay did not start")
+            # The publisher thread sends the whole replay before this batch.
+            publisher.publish(batch)
+            publisher._event_queue.join()
+            numbers = []
+            while True:
+                self.assertTrue(
+                    dealer.poll(1000), f"replay stalled after {numbers[-1:]}"
+                )
+                seq = int.from_bytes(dealer.recv_multipart()[2], "big", signed=True)
+                if seq == -1:
+                    break
+                numbers.append(seq)
+            self.assertEqual(numbers, list(range(first, first + steps)))
 
 
 def _rust_server(ext, grpc_port: int, kv_event_relay):
-    deployment_info = json.dumps({"kv_event_relay": kv_event_relay})
     return ext.Server(
-        ext.ServerArgs(
-            model_path="kv-events-test",
-            served_model_name="kv-events-test",
-            tokenizer_path="",
-            public_tokenizer_path="",
-            revision=None,
-            load_format=None,
-            weight_version=None,
-            hicache_storage_backend=None,
-            hicache_storage_backend_extra_config=None,
-            hicache_storage_prefetch_policy=None,
-            hicache_write_policy=None,
-            host="127.0.0.1",
-            port=_free_port(),
-            http2=None,
+        standalone_server_args(
+            ext,
+            port=get_free_port(),
             grpc_port=grpc_port,
-            grpc_response_timeout_secs=300,
-            api_key=None,
-            admin_api_key=None,
-            log_level="warning",
-            log_level_http=None,
-            chat_template=None,
-            default_chat_template_kwargs="{}",
-            tool_call_parser=None,
-            reasoning_parser=None,
-            stream_response_default_include_usage=False,
-            enable_cache_report=False,
-            tokenizer_worker_num=1,
-            detokenizer_worker_num=1,
-            skip_tokenizer_init=True,
-            skip_server_warmup=True,
-            gc_threshold=None,
-            custom_warmups_pending=False,
-            default_priority_value=None,
-            enable_request_header_overrides=False,
-            enable_request_decompression=False,
-            health_generate_headers={},
-            incremental_streaming_output=False,
-            disaggregation_mode=ext.DisaggregationMode.Null,
-            model_config=ext.ModelConfig(
-                context_len=1024,
-                vocab_size=1000,
-                is_multimodal=False,
-                default_sampling_params=ext.DefaultSamplingParams(),
-                model_type=None,
-                architectures=None,
-            ),
-            preferred_sampling_params=None,
-            default_max_new_tokens=128,
-            lora_ids={},
-            enable_strict_thinking=False,
-            limit_mm_data_per_request=[],
-            allow_auto_truncate=False,
-            enable_return_hidden_states=False,
-            return_hidden_states_mode=None,
-            num_reserved_tokens=0,
-            tokenizer_model_max_length=-1,
-            version="test",
-            max_total_num_tokens=1024,
-            deployment_info=deployment_info,
-            launch_server_info="{}",
-            launch_model_info="{}",
-            load_snapshot_path=None,
-            load_snapshot_dp_size=0,
-            load_snapshot_dp_rank=0,
-            accelerator=None,
-            num_accelerators=0,
-            metrics=None,
-            request_log=None,
-            crash_dump=False,
-            server_added_custom_params=[],
+            deployment_info=json.dumps({"kv_event_relay": kv_event_relay}),
         )
     )
 
@@ -339,7 +344,7 @@ class TestRustServerKvEventStream(CustomTestCase):
 
     def setUp(self):
         self.ext = importlib.import_module("sglang.srt.rust_extensions._server")
-        self.grpc_port = _free_port()
+        self.grpc_port = get_free_port()
         self.stream = KvEventStream(self.grpc_port)
         self.addCleanup(self.stream.close)
 
@@ -350,7 +355,7 @@ class TestRustServerKvEventStream(CustomTestCase):
 
     def test_stream_carries_the_zmq_sequence_numbers(self):
         # Rank 2 publishes on the configured port + 2.
-        endpoint = f"tcp://*:{_free_port() - 2}"
+        endpoint = f"tcp://*:{get_free_port() - 2}"
         publisher = EventPublisherFactory.create(
             json.dumps({"publisher": "zmq", "endpoint": endpoint}),
             attn_dp_rank=2,

@@ -182,8 +182,11 @@ def test_typed_config_forwards_resolved_launch_fields(overrides, kwarg, expected
         {"dp_rank": 0, "endpoint": "http://127.0.0.1:30000"}
     ]
     # Rust reads absent keys as defaults, so every contract field must be sent
-    # under its contract name.
-    assert set(api_types.DeploymentInfo.__struct_fields__) <= set(deployment_info)
+    # under its contract name; it derives grpc_kv_event_sources from kv_event_relay.
+    derived = {"grpc_kv_event_sources"}
+    assert set(api_types.DeploymentInfo.__struct_fields__) - derived <= set(
+        deployment_info
+    )
 
 
 @pytest.mark.parametrize(
@@ -219,33 +222,6 @@ def test_deployment_info_reports_listener_dp_rank(server_args, ranks, expected):
         extension.ServerArgs.call_args.kwargs["deployment_info"]
     )
     assert deployment_info["dp_rank"] == expected
-
-
-@pytest.mark.parametrize(
-    "relay",
-    [None, {"dp_rank": 3, "endpoint": "ipc:///kv/events", "replay_endpoint": "x"}],
-    ids=["kv-events-off", "relayed"],
-)
-def test_grpc_kv_event_source_is_advertised_only_with_a_relay(relay):
-    """With KV events off, a listener reports no gRPC stream; with them on, it
-    reports its rank's stream on its own gRPC port and passes on the relay's
-    private sockets."""
-    scheduler = _scheduler_for_typed_config()
-    scheduler.kv_events_publisher.local_kv_event_relay.return_value = relay
-    extension = MagicMock()
-    with (
-        get_context().override_server_args(grpc_port=50051),
-        get_parallel().override(attn_dp_rank=0, dp_rank=None),
-        patch.object(rust_config, "compute_num_reserved_tokens", return_value=0),
-        patch.object(rust_config, "_launch_server_info", return_value="{}"),
-    ):
-        rust_config._build_server_args(scheduler, extension=extension)
-    deployment_info = json.loads(
-        extension.ServerArgs.call_args.kwargs["deployment_info"]
-    )
-    assert deployment_info["kv_event_relay"] == relay
-    expected = [dict(dp_rank=3, endpoint="", topic="", block_size=16)]
-    assert deployment_info["grpc_kv_event_sources"] == (expected if relay else [])
 
 
 @pytest.mark.parametrize("enable_metrics", [False, True])

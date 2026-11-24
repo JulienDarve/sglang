@@ -96,16 +96,21 @@ pub mod kv_events_client {
         ///
         /// The first response is `start`; every later one is a `batch`, in
         /// sequence-number order, each number once. Without `resume`, the stream
-        /// starts with the next batch the engine publishes. With `resume`, it first
-        /// replays the engine's buffered batches from the cursor, then continues
-        /// live.
+        /// starts with the next batch the server forwards. With `resume`, it first
+        /// replays the engine's buffered batches from the cursor (the scheduler keeps
+        /// `buffer_steps` of them), then continues live.
+        ///
+        /// Each batch is one message, however large; raise the client's receive
+        /// limit above gRPC's default 4 MiB for long prompts.
         ///
         /// INVALID_ARGUMENT: this listener does not serve the rank.
-        /// FAILED_PRECONDITION: KV events are off.
-        /// OUT_OF_RANGE: the cursor is older than the engine's buffer, or its
+        /// FAILED_PRECONDITION: the scheduler publishes no KV cache events over ZMQ.
+        /// OUT_OF_RANGE: the cursor's batches are no longer buffered, or its
         /// `stream_id` is not the current one.
-        /// DATA_LOSS: batches after the last one sent cannot be recovered from the
-        /// engine's buffer.
+        /// DATA_LOSS: batches after the last one sent can no longer be recovered
+        /// from the engine's buffer.
+        /// UNAVAILABLE: the engine's replay socket did not answer, the relay
+        /// stopped, or the server is shutting down.
         pub async fn subscribe_kv_events(
             &mut self,
             request: impl tonic::IntoRequest<super::SubscribeKvEventsRequest>,
@@ -150,16 +155,21 @@ pub mod kv_events_server {
         ///
         /// The first response is `start`; every later one is a `batch`, in
         /// sequence-number order, each number once. Without `resume`, the stream
-        /// starts with the next batch the engine publishes. With `resume`, it first
-        /// replays the engine's buffered batches from the cursor, then continues
-        /// live.
+        /// starts with the next batch the server forwards. With `resume`, it first
+        /// replays the engine's buffered batches from the cursor (the scheduler keeps
+        /// `buffer_steps` of them), then continues live.
+        ///
+        /// Each batch is one message, however large; raise the client's receive
+        /// limit above gRPC's default 4 MiB for long prompts.
         ///
         /// INVALID_ARGUMENT: this listener does not serve the rank.
-        /// FAILED_PRECONDITION: KV events are off.
-        /// OUT_OF_RANGE: the cursor is older than the engine's buffer, or its
+        /// FAILED_PRECONDITION: the scheduler publishes no KV cache events over ZMQ.
+        /// OUT_OF_RANGE: the cursor's batches are no longer buffered, or its
         /// `stream_id` is not the current one.
-        /// DATA_LOSS: batches after the last one sent cannot be recovered from the
-        /// engine's buffer.
+        /// DATA_LOSS: batches after the last one sent can no longer be recovered
+        /// from the engine's buffer.
+        /// UNAVAILABLE: the engine's replay socket did not answer, the relay
+        /// stopped, or the server is shutting down.
         async fn subscribe_kv_events(
             &self,
             request: tonic::Request<super::SubscribeKvEventsRequest>,

@@ -100,10 +100,12 @@ class TestRustServerKvEvents(CustomTestCase):
             subscriber.setsockopt(zmq.RCVTIMEO, 30_000)
             subscriber.connect(f"tcp://127.0.0.1:{self.zmq_port}")
             # A SUB socket misses what is published before it joins.
-            attempt = 0
-            while not subscriber.poll(500):
+            for attempt in range(60):
+                if subscriber.poll(500):
+                    break
                 self._generate(f"Warm-up {attempt}: name three colors.")
-                attempt += 1
+            else:
+                self.fail("no KV event batch reached the ZMQ subscriber")
             self._generate("The capital of France is Paris. The capital of Italy is")
             self._post("/flush_cache")
             while True:

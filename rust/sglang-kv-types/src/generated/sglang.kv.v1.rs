@@ -33,7 +33,7 @@ pub mod subscribe_kv_events_response {
 }
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct KvEventStreamStart {
-    /// changes when the engine restarts or batches are lost for good
+    /// changes when the server restarts
     #[prost(string, tag = "1")]
     pub stream_id: ::prost::alloc::string::String,
     #[prost(uint32, tag = "2")]
