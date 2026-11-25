@@ -23,6 +23,8 @@ import hashlib
 import logging
 import os
 import queue
+import shutil
+import tempfile
 import threading
 import time
 from abc import ABC, abstractmethod
@@ -370,6 +372,10 @@ class EventPublisher(ABC):
         """Describe a source accessible to a separate local process, if any."""
         return None
 
+    def describe_local_relay(self, block_size: int) -> Optional[dict[str, Any]]:
+        """Describe the private sockets the embedded Rust server relays, if any."""
+        return None
+
 
 class NullEventPublisher(EventPublisher):
     """No-op implementation (default when disabled)."""
@@ -406,6 +412,9 @@ class ZmqEventPublisher(EventPublisher):
     bind:
         Whether to bind the PUB socket. When unset, preserve the endpoint-based
         heuristic: bind wildcard, IPC and inproc addresses; connect otherwise.
+    local_relay:
+        Also bind the PUB and a ROUTER replay socket on private ``ipc://``
+        addresses, which the embedded Rust server serves over gRPC.
     """
 
     SHUTDOWN_TIMEOUT: float = 1.0
@@ -421,6 +430,7 @@ class ZmqEventPublisher(EventPublisher):
         max_queue_size: int = 100_000,
         topic: str = "",
         bind: Optional[bool] = None,
+        local_relay: bool = False,
     ) -> None:
         # Storage
         self._event_queue = Queue[Optional[EventBatch]](maxsize=max_queue_size)
@@ -439,6 +449,8 @@ class ZmqEventPublisher(EventPublisher):
             replay_endpoint, self._dp_rank
         )
         self._hwm = hwm
+        self._local_relay = local_relay
+        self._relay_dir: Optional[str] = None
         self._socket_setup()
 
         # Payload
@@ -500,6 +512,16 @@ class ZmqEventPublisher(EventPublisher):
             source["replay_endpoint"] = replay_endpoint
         return source
 
+    def describe_local_relay(self, block_size: int) -> Optional[dict[str, Any]]:
+        if self._relay_dir is None:
+            return None
+        return {
+            "dp_rank": self._dp_rank,
+            "block_size": block_size,
+            "endpoint": f"ipc://{self._relay_dir}/e",
+            "replay_endpoint": f"ipc://{self._relay_dir}/r",
+        }
+
     def shutdown(self) -> None:
         """Stop the publisher thread and clean up resources."""
         self._running = False
@@ -533,6 +555,8 @@ class ZmqEventPublisher(EventPublisher):
                 self._replay.close(linger=0)
         finally:
             pass  # Do not terminate context; other sockets may use it
+        if self._relay_dir is not None:
+            shutil.rmtree(self._relay_dir, ignore_errors=True)
 
     def _socket_setup(self) -> None:
         """Initialize sockets
@@ -569,13 +593,25 @@ class ZmqEventPublisher(EventPublisher):
         # 1) handles multiple REQ clients (identities)
         # 2) lets us send back one request → many replies (streamed events)
         # 3) works in our non‑blocking poll loop alongside PUB
-        if self._replay_endpoint is not None:
+        if self._replay_endpoint is not None or self._local_relay:
             self._replay = self._ctx.socket(zmq.ROUTER)
+            # ZMQ acks reads only every HWM/2 messages, so the sender can see up to
+            # HWM/2 stale messages; 2x lets a full replay plus marker always fit.
+            self._replay.setsockopt(zmq.SNDHWM, 2 * (self._buffer.maxlen + 1))
+        if self._replay_endpoint is not None:
             logger.debug(
                 f"ZmqEventPublisher socket replay_endpoint bind to {self._replay_endpoint}"
             )
             self._replay.bind(self._replay_endpoint)
             self._local_replay_endpoint = self._bound_endpoint(self._replay)
+
+        # After the user's endpoints, whose bound addresses are read above.
+        if self._local_relay:
+            # Mode 0700: only this user can reach the relay's sockets. They add 12 bytes
+            # to the temp directory, as other ipc sockets do: a socket path holds 107.
+            self._relay_dir = tempfile.mkdtemp(prefix="k")
+            self._pub.bind(f"ipc://{self._relay_dir}/e")
+            self._replay.bind(f"ipc://{self._relay_dir}/r")
 
     @staticmethod
     def _bound_endpoint(socket: zmq.Socket) -> str:
@@ -751,8 +787,11 @@ class EventPublisherFactory:
         cls._registry[name] = ctor
 
     @classmethod
-    def create(cls, config: Optional[str], attn_dp_rank: int = 0) -> EventPublisher:
-        """Create publisher from a config mapping."""
+    def create(
+        cls, config: Optional[str], attn_dp_rank: int = 0, local_relay: bool = False
+    ) -> EventPublisher:
+        """Create publisher from a config mapping. ``local_relay`` applies to the
+        "zmq" publisher only."""
         if not config:
             return NullEventPublisher()
         config = KVEventsConfig.from_cli(config)
@@ -763,6 +802,8 @@ class EventPublisherFactory:
         kind = config_dict.pop("publisher", "null")
         if kind == "null":
             return NullEventPublisher()
+        if kind == "zmq":
+            config_dict["local_relay"] = local_relay
         try:
             constructor = cls._registry[kind]
         except KeyError as exc:

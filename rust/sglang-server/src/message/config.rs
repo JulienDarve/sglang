@@ -624,6 +624,11 @@ pub struct DeploymentInfo {
     pub hicache_write_policy: Option<String>,
     pub hicache_host_total_tokens: Option<u64>,
     pub kv_event_sources: Vec<KvEventSource>,
+    /// The scheduler publisher's private sockets this listener relays as
+    /// `sglang.kv.v1`; set only when it publishes and gRPC is on. Reported
+    /// only as gRPC's `grpc_kv_event_sources`.
+    #[serde(skip_serializing)]
+    pub kv_event_relay: Option<KvEventRelayConfig>,
     pub rust_server_endpoints: Vec<RustServerEndpoint>,
     /// Every Rust listener of this launch on this node; the same table on each.
     pub node_listeners: Vec<NodeRustListener>,
@@ -672,6 +677,16 @@ pub struct KvEventSource {
     pub endpoint: String,
     pub topic: String,
     pub block_size: u32,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+pub struct KvEventRelayConfig {
+    pub dp_rank: u32,
+    pub block_size: u32,
+    /// The publisher's PUB socket.
+    pub endpoint: String,
+    /// The publisher's ROUTER replay socket.
+    pub replay_endpoint: String,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]

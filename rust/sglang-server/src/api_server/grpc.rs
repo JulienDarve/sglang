@@ -12,5 +12,6 @@
 
 pub(crate) mod app;
 mod info;
+pub(crate) mod kv_events;
 mod native_api;
 pub(crate) mod service;

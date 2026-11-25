@@ -24731,6 +24731,13 @@ impl ::serde::Serialize for DeploymentInfo {
                 &self.node_listeners,
             )?;
         }
+        if !self.grpc_kv_event_sources.is_empty() {
+            ::serde::ser::SerializeMap::serialize_entry(
+                &mut map,
+                "grpc_kv_event_sources",
+                &self.grpc_kv_event_sources,
+            )?;
+        }
         ::serde::ser::SerializeMap::end(map)
     }
 }
@@ -24767,6 +24774,7 @@ impl<'de> ::serde::Deserialize<'de> for DeploymentInfo {
                 let mut f_hicache_host_total_tokens = None;
                 let mut f_kv_event_sources = None;
                 let mut f_node_listeners = None;
+                let mut f_grpc_kv_event_sources = None;
                 while let Some(key) = map.next_key::<::std::borrow::Cow<'_, str>>()? {
                     match key.as_ref() {
                         "disaggregation_bootstrap_port" => {
@@ -24917,6 +24925,17 @@ impl<'de> ::serde::Deserialize<'de> for DeploymentInfo {
                                     .unwrap_or_default(),
                             );
                         }
+                        "grpc_kv_event_sources" => {
+                            if f_grpc_kv_event_sources.is_some() {
+                                return Err(::serde::de::Error::duplicate_field(
+                                    "grpc_kv_event_sources",
+                                ));
+                            }
+                            f_grpc_kv_event_sources = Some(
+                                map.next_value::<Option<Vec<KvEventSource>>>()?
+                                    .unwrap_or_default(),
+                            );
+                        }
                         _ => {
                             map.next_value::<::serde::de::IgnoredAny>()?;
                         }
@@ -24943,6 +24962,7 @@ impl<'de> ::serde::Deserialize<'de> for DeploymentInfo {
                     hicache_host_total_tokens: f_hicache_host_total_tokens.flatten(),
                     kv_event_sources: f_kv_event_sources.unwrap_or_default(),
                     node_listeners: f_node_listeners.unwrap_or_default(),
+                    grpc_kv_event_sources: f_grpc_kv_event_sources.unwrap_or_default(),
                 })
             }
         }

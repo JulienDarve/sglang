@@ -419,7 +419,10 @@ class TestModelInfoTransportParity(CustomTestCase):
         scheduler = SimpleNamespace(
             server_args=server_args,
             model_config=model_config,
-            kv_events_publisher=SimpleNamespace(local_kv_event_sources=lambda _: []),
+            kv_events_publisher=SimpleNamespace(
+                local_kv_event_sources=lambda _: [],
+                local_kv_event_relay=lambda _: None,
+            ),
             page_size=1,
             tree_cache=None,
             # The server loads the scheduler's tokenizer copy but reports the

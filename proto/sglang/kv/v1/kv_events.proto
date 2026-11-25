@@ -1,0 +1,97 @@
+syntax = "proto3";
+package sglang.kv.v1;
+
+// KV cache events of the scheduler, as its ZMQ publisher emits them
+// (`python/sglang/srt/disaggregation/kv_events.py`), with the same sequence
+// numbers.
+service KvEvents {
+  // One stream per data-parallel rank; each Rust listener serves its own rank.
+  //
+  // The first response is `start`; every later one is a `batch`, in
+  // sequence-number order, each number once. Without `resume`, the stream
+  // starts with the next batch the server forwards. With `resume`, it first
+  // replays the engine's buffered batches from the cursor (the scheduler keeps
+  // `buffer_steps` of them), then continues live.
+  //
+  // Each batch is one message, however large; raise the client's receive
+  // limit above gRPC's default 4 MiB for long prompts.
+  //
+  // INVALID_ARGUMENT: this listener does not serve the rank.
+  // FAILED_PRECONDITION: the scheduler publishes no KV cache events over ZMQ.
+  // OUT_OF_RANGE: the cursor's batches are no longer buffered, or its
+  //   `stream_id` is not the current one.
+  // DATA_LOSS: batches after the last one sent can no longer be recovered
+  //   from the engine's buffer.
+  // UNAVAILABLE: the engine's replay socket did not answer, the relay
+  //   stopped, or the server is shutting down.
+  rpc SubscribeKvEvents(SubscribeKvEventsRequest) returns (stream SubscribeKvEventsResponse);
+}
+
+message SubscribeKvEventsRequest {
+  uint32 data_parallel_rank = 1;
+  optional KvEventCursor resume = 2;       // absent: live batches only
+}
+
+// A cursor past the newest batch is accepted and waits for that number; an
+// empty `stream_id` gives up the detection of a server restart.
+message KvEventCursor {
+  string stream_id = 1;                    // empty: the current stream
+  uint64 next_sequence_number = 2;
+}
+
+message SubscribeKvEventsResponse {
+  oneof item {
+    KvEventStreamStart start = 1;          // always first
+    KvEventBatch batch = 2;
+  }
+}
+
+message KvEventStreamStart {
+  string stream_id = 1;                    // changes when the server restarts
+  uint32 data_parallel_rank = 2;
+}
+
+// Mirrors the engine's EventBatch: [ts, events, attn_dp_rank], plus the ZMQ sequence frame.
+message KvEventBatch {
+  uint64 sequence_number = 1;              // the engine publisher's own number, same as on ZMQ
+  double ts = 2;
+  optional uint32 attn_dp_rank = 3;
+  repeated KvCacheEvent events = 4;
+}
+
+message KvCacheEvent {
+  oneof event {
+    BlockStored block_stored = 1;
+    BlockRemoved block_removed = 2;
+    AllBlocksCleared all_blocks_cleared = 3;
+  }
+}
+
+message BlockStored {
+  repeated int64 block_hashes = 1;
+  optional int64 parent_block_hash = 2;    // unset for a root block
+  oneof token_ids {                        // flat across all blocks in the event
+    TokenIdList single = 3;
+    TokenIdPairList pairs = 4;             // EAGLE pages: [token, next token]
+  }
+  uint32 block_size = 5;
+  optional int64 lora_id = 6;              // deprecated
+  optional string medium = 7;
+  optional string cache_salt = 8;
+  optional string session_id = 9;
+  optional string lora_name = 10;
+  repeated BlockMmRoutingSpans mm_routing_spans = 11;  // one per block
+}
+message TokenIdList { repeated uint64 token_ids = 1; }
+message TokenIdPairList { repeated TokenIdPair pairs = 1; }
+message TokenIdPair { uint64 first = 1; uint64 second = 2; }
+
+message BlockRemoved {
+  repeated int64 block_hashes = 1;
+  optional string medium = 2;
+}
+
+message AllBlocksCleared {}
+
+message BlockMmRoutingSpans { repeated MmRoutingSpan spans = 1; }
+message MmRoutingSpan { uint64 start = 1; uint64 length = 2; string label = 3; }

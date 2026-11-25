@@ -52,7 +52,8 @@ def _scheduler_for_typed_config(load_snapshot_writer=None):
         kv_events_publisher=SimpleNamespace(
             local_kv_event_sources=MagicMock(
                 return_value=[{"endpoint": "tcp://127.0.0.1:5557"}]
-            )
+            ),
+            local_kv_event_relay=MagicMock(return_value=None),
         ),
         page_size=16,
         tree_cache=None,
@@ -181,8 +182,11 @@ def test_typed_config_forwards_resolved_launch_fields(overrides, kwarg, expected
         {"dp_rank": 0, "endpoint": "http://127.0.0.1:30000"}
     ]
     # Rust reads absent keys as defaults, so every contract field must be sent
-    # under its contract name.
-    assert set(api_types.DeploymentInfo.__struct_fields__) <= set(deployment_info)
+    # under its contract name; it derives grpc_kv_event_sources from kv_event_relay.
+    derived = {"grpc_kv_event_sources"}
+    assert set(api_types.DeploymentInfo.__struct_fields__) - derived <= set(
+        deployment_info
+    )
 
 
 @pytest.mark.parametrize(

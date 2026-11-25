@@ -644,9 +644,21 @@ pub fn start(cfg: RuntimeConfig, http_layer: Option<HttpLayer>) -> Result<Runtim
                         tokenizer.clone(),
                     );
                     if let Some((listener, service)) = grpc_server {
+                        let kv_event_relay = cfg
+                            .server_args
+                            .deployment_info
+                            .kv_event_relay
+                            .as_ref()
+                            .map(api_server::grpc::kv_events::KvEventRelay::start);
                         tokio::join!(
                             http,
-                            api_server::grpc::app::serve(listener, service, core, shutdown_rx)
+                            api_server::grpc::app::serve(
+                                listener,
+                                service,
+                                kv_event_relay,
+                                core,
+                                shutdown_rx
+                            )
                         );
                     } else {
                         http.await;

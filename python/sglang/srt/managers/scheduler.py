@@ -2898,6 +2898,8 @@ class Scheduler(
             max_running_requests=self.max_running_requests,
             max_total_num_tokens=self.max_total_num_tokens,
             get_stats=lambda: self.metrics_reporter.stats,
+            local_relay=self._hosts_rust_server()
+            and get_serving().grpc_port is not None,
         )
 
     def init_load_publisher(self) -> None:

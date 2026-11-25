@@ -9,9 +9,11 @@ the router can subscribe per replica (the `dp_size` it reads from
 
 import atexit
 import json
+import os
 import threading
 import time
 import unittest
+from typing import get_args, get_type_hints
 from unittest.mock import patch
 
 import msgspec
@@ -21,6 +23,7 @@ from sglang.srt.disaggregation.kv_events import (
     AllBlocksCleared,
     BlockRemoved,
     BlockStored,
+    EventBatch,
     EventPublisherFactory,
     KVEventBatch,
     NullEventPublisher,
@@ -38,11 +41,19 @@ from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=12, suite="base-a-test-cpu")
 
+RUST_KV_EVENT_BATCH_FIXTURE = os.path.join(
+    os.path.dirname(__file__),
+    *[os.pardir] * 4,
+    "rust/sglang-server/testdata/kv_event_batch.hex",
+)
+
 
 class TestLocalKvEventSource(CustomTestCase):
-    def _publisher(self, attn_dp_rank=0, **config):
+    def _publisher(self, attn_dp_rank=0, local_relay=False, **config):
         publisher = EventPublisherFactory.create(
-            json.dumps({"publisher": "zmq", **config}), attn_dp_rank=attn_dp_rank
+            json.dumps({"publisher": "zmq", **config}),
+            attn_dp_rank=attn_dp_rank,
+            local_relay=local_relay,
         )
         atexit.unregister(publisher.shutdown)
         self.addCleanup(publisher.shutdown)
@@ -88,6 +99,26 @@ class TestLocalKvEventSource(CustomTestCase):
             else:
                 self.fail("No event received from the advertised local source")
 
+    def test_private_sockets_carry_the_stream_for_the_rust_server(self):
+        """The private sockets the Rust server relays carry the published batches
+        and a replay; only a publishing zmq publisher binds them."""
+        for config in (None, json.dumps({"publisher": "null"})):
+            off = EventPublisherFactory.create(config, local_relay=True)
+            self.assertIsNone(off.describe_local_relay(16))
+
+        publisher = self._publisher(local_relay=True, endpoint="inproc://kv-relay-test")
+        relay = publisher.describe_local_relay(16)
+        self.assertEqual((relay["dp_rank"], relay["block_size"]), (0, 16))
+        self._assert_event_received(publisher, {**relay, "topic": ""})
+
+        # No replay endpoint is configured: the private one still answers.
+        dealer = zmq.Context.instance().socket(zmq.DEALER)
+        self.addCleanup(dealer.close, linger=0)
+        dealer.setsockopt(zmq.RCVTIMEO, 5000)
+        dealer.connect(relay["replay_endpoint"])
+        dealer.send_multipart([b"", (0).to_bytes(8, "big")])
+        self.assertEqual(dealer.recv_multipart()[2], (0).to_bytes(8, "big"))
+
 
 class TestNullPublisherConfig(CustomTestCase):
     def test_config_without_a_real_publisher_builds_the_noop(self):
@@ -111,12 +142,16 @@ class TestShutdown(CustomTestCase):
     def test_full_queue_does_not_skip_socket_cleanup(self):
         with patch.object(threading.Thread, "start"):
             publisher = ZmqEventPublisher(
-                attn_dp_rank=0, endpoint="inproc://kv-shutdown-test", max_queue_size=1
+                attn_dp_rank=0,
+                endpoint="inproc://kv-shutdown-test",
+                max_queue_size=1,
+                local_relay=True,
             )
         atexit.unregister(publisher.shutdown)
         publisher.publish(KVEventBatch(ts=1.0, events=[]))
         publisher.shutdown()
         self.assertTrue(publisher._pub.closed)
+        self.assertFalse(os.path.exists(publisher._relay_dir))
 
 
 class TestResolveLoadPubRange(CustomTestCase):
@@ -185,6 +220,68 @@ class TestBlockStoredWireFormat(CustomTestCase):
         self.assertIsInstance(round_tripped.events[4], AllBlocksCleared)
 
 
+class TestRustServerDecodedFields(CustomTestCase):
+    def test_event_fields_match_the_rust_server_decoder(self):
+        """A new event type fails the Rust server's decoder (kv_events/wire.rs), a new
+        field is dropped: add both there, in proto/sglang/kv/v1 and in the fixture."""
+        self.assertEqual(EventBatch.__struct_fields__, ("ts", "events", "attn_dp_rank"))
+        (events,) = get_args(get_type_hints(KVEventBatch)["events"])
+        self.assertEqual(
+            {
+                event.__struct_config__.tag: event.__struct_fields__
+                for event in get_args(events)
+            },
+            {
+                "BlockStored": (
+                    "block_hashes",
+                    "parent_block_hash",
+                    "token_ids",
+                    "block_size",
+                    "lora_id",
+                    "medium",
+                    "cache_salt",
+                    "session_id",
+                    "lora_name",
+                    "mm_routing_spans",
+                ),
+                "BlockRemoved": ("block_hashes", "medium"),
+                "AllBlocksCleared": (),
+            },
+        )
+        batch = KVEventBatch(
+            ts=1.5,
+            attn_dp_rank=3,
+            events=[
+                BlockStored(
+                    block_hashes=[-7, 2**62],
+                    parent_block_hash=-1,
+                    token_ids=[1, 2, 2**40, 3],
+                    block_size=2,
+                    lora_id=5,
+                    medium=StorageMedium.CPU,
+                    cache_salt="salt",
+                    session_id="session",
+                    lora_name="adapter",
+                    mm_routing_spans=[[(0, 1, "image")], []],
+                ),
+                # An EAGLE page: (token, next token) pairs.
+                BlockStored(
+                    block_hashes=[11],
+                    parent_block_hash=None,
+                    token_ids=[(1, 2), (2, 3)],
+                    block_size=2,
+                    lora_id=None,
+                ),
+                BlockRemoved(block_hashes=[-7], medium=StorageMedium.GPU),
+                AllBlocksCleared(),
+            ],
+        )
+        with open(RUST_KV_EVENT_BATCH_FIXTURE) as fixture:
+            self.assertEqual(
+                msgspec.msgpack.encode(batch).hex(), fixture.read().strip()
+            )
+
+
 class TestNamespacedBlockHash(CustomTestCase):
     def test_values_are_pinned(self):
         # Rust has its own copy of this function, and its test uses the same
@@ -243,6 +340,53 @@ class TestReplay(CustomTestCase):
             self.assertEqual(batch.events, [AllBlocksCleared()])
             self.assertEqual(batch.attn_dp_rank, 0)
         self.assertEqual(frames[2][3], b"")
+
+    def test_full_replay_reaches_a_reader_that_reads_after_it_is_sent(self):
+        """A replay of the whole buffer keeps every batch and the end marker
+        although the reader takes nothing until the burst is sent, also after
+        earlier replays leave ZMQ's read acknowledgements stale."""
+        steps = 2500
+        replay = f"tcp://127.0.0.1:{get_free_port()}"
+        publisher = ZmqEventPublisher(
+            attn_dp_rank=0,
+            endpoint="inproc://kv-full-replay-test",
+            replay_endpoint=replay,
+            buffer_steps=steps,
+        )
+        atexit.unregister(publisher.shutdown)
+        self.addCleanup(publisher.shutdown)
+        dealer = zmq.Context.instance().socket(zmq.DEALER)
+        self.addCleanup(dealer.close, linger=0)
+        dealer.connect(replay)
+        # About 3 KB each, more than the socket buffers hold in all.
+        stored = BlockStored(
+            block_hashes=[1],
+            parent_block_hash=None,
+            token_ids=list(range(1000)),
+            block_size=1000,
+            lora_id=None,
+        )
+        batch = KVEventBatch(ts=1.0, events=[stored])
+        for _ in range(steps):
+            publisher.publish(batch)
+        publisher._event_queue.join()
+
+        for first in range(4):
+            dealer.send_multipart([b"", (0).to_bytes(8, "big")])
+            self.assertTrue(dealer.poll(5000), "the replay did not start")
+            # The publisher thread sends the whole replay before this batch.
+            publisher.publish(batch)
+            publisher._event_queue.join()
+            numbers = []
+            while True:
+                self.assertTrue(
+                    dealer.poll(1000), f"replay stalled after {numbers[-1:]}"
+                )
+                seq = int.from_bytes(dealer.recv_multipart()[2], "big", signed=True)
+                if seq == -1:
+                    break
+                numbers.append(seq)
+            self.assertEqual(numbers, list(range(first, first + steps)))
 
 
 if __name__ == "__main__":

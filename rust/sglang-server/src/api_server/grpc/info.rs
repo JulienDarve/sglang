@@ -124,6 +124,17 @@ pub(super) fn server_info(info: ServerInfo) -> Result<api::GetServerInfoResponse
                     block_size: source.block_size,
                 })
                 .collect(),
+            // The relayed stream; an empty endpoint is this gRPC server.
+            grpc_kv_event_sources: deployment_info
+                .kv_event_relay
+                .into_iter()
+                .map(|relay| api::KvEventSource {
+                    dp_rank: relay.dp_rank,
+                    endpoint: String::new(),
+                    topic: String::new(),
+                    block_size: relay.block_size,
+                })
+                .collect(),
             node_listeners: deployment_info
                 .node_listeners
                 .into_iter()

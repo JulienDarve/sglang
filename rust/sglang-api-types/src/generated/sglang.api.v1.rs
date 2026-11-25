@@ -3969,6 +3969,11 @@ pub struct DeploymentInfo {
     /// Each of them reports the same list, so one connection finds the rest.
     #[prost(message, repeated, tag = "20")]
     pub node_listeners: ::prost::alloc::vec::Vec<NodeRustListener>,
+    /// The ranks this listener streams over `sglang.kv.v1.KvEvents`; endpoint and
+    /// topic are empty. Kept apart from kv_event_sources, where clients reject a
+    /// second source for one rank.
+    #[prost(message, repeated, tag = "21")]
+    pub grpc_kv_event_sources: ::prost::alloc::vec::Vec<KvEventSource>,
 }
 /// One Rust listener: the HTTP (and native gRPC) server embedded by a DP-group
 /// leader scheduler.

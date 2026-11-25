@@ -2217,9 +2217,11 @@ mod tests {
     }
 
     /// Out-of-process orchestrators read these launch facts to reproduce the
-    /// server's token admission.
+    /// server's token admission and to find its KV event stream.
     #[tokio::test]
     async fn server_info_reports_launch_facts_for_orchestrators() {
+        use crate::message::config::{DeploymentInfo, KvEventRelayConfig};
+
         let Harness {
             service,
             intake_rx,
@@ -2234,6 +2236,15 @@ mod tests {
                 allow_auto_truncate: true,
                 skip_tokenizer_init: true,
                 num_reserved_tokens: 4,
+                deployment_info: DeploymentInfo {
+                    kv_event_relay: Some(KvEventRelayConfig {
+                        dp_rank: 1,
+                        block_size: 16,
+                        endpoint: "ipc:///kv/events".into(),
+                        replay_endpoint: "ipc:///kv/replay".into(),
+                    }),
+                    ..Default::default()
+                },
                 ..test_server_args()
             },
         );
@@ -2264,6 +2275,15 @@ mod tests {
         assert!(info.allow_auto_truncate);
         assert!(info.skip_tokenizer_init);
         assert_eq!(info.num_reserved_tokens, 4);
+        // The relayed stream is its own list, without the private sockets.
+        let deployment = info.deployment_info.unwrap();
+        assert!(deployment.kv_event_sources.is_empty());
+        let relayed = api::KvEventSource {
+            dp_rank: 1,
+            block_size: 16,
+            ..Default::default()
+        };
+        assert_eq!(deployment.grpc_kv_event_sources, [relayed]);
     }
 
     /// gRPC `GetServerInfo` advertises the same nonempty owning-runtime id on
