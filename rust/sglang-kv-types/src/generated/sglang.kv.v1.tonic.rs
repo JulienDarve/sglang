@@ -131,6 +131,36 @@ pub mod kv_events_client {
             ));
             self.inner.server_streaming(req, path, codec).await
         }
+        /// Streams the blocks that this listener's rank holds in its device cache
+        /// (medium `GPU`), as the stores that recreate them: applied in order to an
+        /// empty state, they give the state after every batch before `end.resume`.
+        /// A block follows its parent. A block whose parent is not held is left out,
+        /// so a client that loaded the snapshot lacks it, also once the parent is
+        /// stored again. The last response is `end`; a stream that ends without it
+        /// is not a snapshot. To follow the cache from the snapshot, subscribe with
+        /// `end.resume`.
+        ///
+        /// INVALID_ARGUMENT: this listener does not serve the rank.
+        /// FAILED_PRECONDITION: the scheduler publishes no KV cache events over ZMQ,
+        /// or `grpc_snapshot` is false in its KV events config.
+        /// UNAVAILABLE: the server is shutting down.
+        pub async fn get_kv_snapshot(
+            &mut self,
+            request: impl tonic::IntoRequest<super::GetKvSnapshotRequest>,
+        ) -> std::result::Result<
+            tonic::Response<tonic::codec::Streaming<super::GetKvSnapshotResponse>>,
+            tonic::Status,
+        > {
+            self.inner.ready().await.map_err(|e| {
+                tonic::Status::unknown(format!("Service was not ready: {}", e.into()))
+            })?;
+            let codec = tonic_prost::ProstCodec::default();
+            let path = http::uri::PathAndQuery::from_static("/sglang.kv.v1.KvEvents/GetKvSnapshot");
+            let mut req = request.into_request();
+            req.extensions_mut()
+                .insert(GrpcMethod::new("sglang.kv.v1.KvEvents", "GetKvSnapshot"));
+            self.inner.server_streaming(req, path, codec).await
+        }
     }
 }
 /// Generated server implementations.
@@ -174,6 +204,28 @@ pub mod kv_events_server {
             &self,
             request: tonic::Request<super::SubscribeKvEventsRequest>,
         ) -> std::result::Result<tonic::Response<Self::SubscribeKvEventsStream>, tonic::Status>;
+        /// Server streaming response type for the GetKvSnapshot method.
+        type GetKvSnapshotStream: tonic::codegen::tokio_stream::Stream<
+                Item = std::result::Result<super::GetKvSnapshotResponse, tonic::Status>,
+            > + std::marker::Send
+            + 'static;
+        /// Streams the blocks that this listener's rank holds in its device cache
+        /// (medium `GPU`), as the stores that recreate them: applied in order to an
+        /// empty state, they give the state after every batch before `end.resume`.
+        /// A block follows its parent. A block whose parent is not held is left out,
+        /// so a client that loaded the snapshot lacks it, also once the parent is
+        /// stored again. The last response is `end`; a stream that ends without it
+        /// is not a snapshot. To follow the cache from the snapshot, subscribe with
+        /// `end.resume`.
+        ///
+        /// INVALID_ARGUMENT: this listener does not serve the rank.
+        /// FAILED_PRECONDITION: the scheduler publishes no KV cache events over ZMQ,
+        /// or `grpc_snapshot` is false in its KV events config.
+        /// UNAVAILABLE: the server is shutting down.
+        async fn get_kv_snapshot(
+            &self,
+            request: tonic::Request<super::GetKvSnapshotRequest>,
+        ) -> std::result::Result<tonic::Response<Self::GetKvSnapshotStream>, tonic::Status>;
     }
     /// KV cache events of the scheduler, as its ZMQ publisher emits them
     /// (`python/sglang/srt/disaggregation/kv_events.py`), with the same sequence
@@ -281,6 +333,50 @@ pub mod kv_events_server {
                     let inner = self.inner.clone();
                     let fut = async move {
                         let method = SubscribeKvEventsSvc(inner);
+                        let codec = tonic_prost::ProstCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec)
+                            .apply_compression_config(
+                                accept_compression_encodings,
+                                send_compression_encodings,
+                            )
+                            .apply_max_message_size_config(
+                                max_decoding_message_size,
+                                max_encoding_message_size,
+                            );
+                        let res = grpc.server_streaming(method, req).await;
+                        Ok(res)
+                    };
+                    Box::pin(fut)
+                }
+                "/sglang.kv.v1.KvEvents/GetKvSnapshot" => {
+                    #[allow(non_camel_case_types)]
+                    struct GetKvSnapshotSvc<T: KvEvents>(pub Arc<T>);
+                    impl<T: KvEvents>
+                        tonic::server::ServerStreamingService<super::GetKvSnapshotRequest>
+                        for GetKvSnapshotSvc<T>
+                    {
+                        type Response = super::GetKvSnapshotResponse;
+                        type ResponseStream = T::GetKvSnapshotStream;
+                        type Future =
+                            BoxFuture<tonic::Response<Self::ResponseStream>, tonic::Status>;
+                        fn call(
+                            &mut self,
+                            request: tonic::Request<super::GetKvSnapshotRequest>,
+                        ) -> Self::Future {
+                            let inner = Arc::clone(&self.0);
+                            let fut = async move {
+                                <T as KvEvents>::get_kv_snapshot(&inner, request).await
+                            };
+                            Box::pin(fut)
+                        }
+                    }
+                    let accept_compression_encodings = self.accept_compression_encodings;
+                    let send_compression_encodings = self.send_compression_encodings;
+                    let max_decoding_message_size = self.max_decoding_message_size;
+                    let max_encoding_message_size = self.max_encoding_message_size;
+                    let inner = self.inner.clone();
+                    let fut = async move {
+                        let method = GetKvSnapshotSvc(inner);
                         let codec = tonic_prost::ProstCodec::default();
                         let mut grpc = tonic::server::Grpc::new(codec)
                             .apply_compression_config(

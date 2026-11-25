@@ -41,6 +41,45 @@ pub struct KvEventStreamStart {
     #[prost(uint32, tag = "2")]
     pub data_parallel_rank: u32,
 }
+#[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct GetKvSnapshotRequest {
+    #[prost(uint32, tag = "1")]
+    pub data_parallel_rank: u32,
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct GetKvSnapshotResponse {
+    #[prost(oneof = "get_kv_snapshot_response::Item", tags = "1, 2")]
+    pub item: ::core::option::Option<get_kv_snapshot_response::Item>,
+}
+/// Nested message and enum types in `GetKvSnapshotResponse`.
+pub mod get_kv_snapshot_response {
+    #[derive(Clone, PartialEq, ::prost::Oneof)]
+    pub enum Item {
+        #[prost(message, tag = "1")]
+        Blocks(super::KvSnapshotBlocks),
+        /// always last
+        #[prost(message, tag = "2")]
+        End(super::KvSnapshotEnd),
+    }
+}
+/// `session_id` is never set on these stores: it describes a store event, not
+/// a block.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct KvSnapshotBlocks {
+    #[prost(message, repeated, tag = "1")]
+    pub stored: ::prost::alloc::vec::Vec<BlockStored>,
+}
+/// `complete` is false when the server missed batches, so the snapshot may lack
+/// blocks the cache holds or hold blocks the cache dropped; it is true again
+/// once the engine clears its cache.
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct KvSnapshotEnd {
+    /// the first batch the snapshot does not include
+    #[prost(message, optional, tag = "1")]
+    pub resume: ::core::option::Option<KvEventCursor>,
+    #[prost(bool, tag = "2")]
+    pub complete: bool,
+}
 /// Mirrors the engine's EventBatch: \[ts, events, rank\], plus the ZMQ sequence frame.
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct KvEventBatch {
@@ -173,6 +212,9 @@ pub struct BlockStored {
     /// vLLM, one per block
     #[prost(message, repeated, tag = "17")]
     pub lookahead_token_ids: ::prost::alloc::vec::Vec<TokenIdList>,
+    /// vLLM: reports reused blocks, stores none
+    #[prost(bool, tag = "18")]
+    pub reuse_report: bool,
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct BlockRemoved {

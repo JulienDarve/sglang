@@ -34,6 +34,7 @@ impl Publisher {
             block_size: 16,
             endpoint: format!("ipc://{}/events", dir.display()),
             replay_endpoint: format!("ipc://{}/replay", dir.display()),
+            grpc_snapshot: true,
         };
         let mut events = PubSocket::new();
         events.bind(&config.endpoint).await.unwrap();
@@ -140,7 +141,57 @@ async fn next_batch(stream: &mut Responses) -> Result<pb::KvEventBatch, Status> 
 
 /// `[ts, events, attn_dp_rank]` with no events.
 fn empty_batch() -> Bytes {
-    rmp_serde::to_vec(&(0.5, [(); 0], 0)).unwrap().into()
+    batch(&[])
+}
+
+/// `[ts, events, attn_dp_rank]`, the events as msgspec encodes them.
+fn batch(events: &[serde_json::Value]) -> Bytes {
+    rmp_serde::to_vec(&(0.5, events, 0)).unwrap().into()
+}
+
+/// A device-tier store of two-token blocks: block `hash` holds `[hash, hash + 100]`.
+fn stored(block_hashes: &[i64], parent_block_hash: Option<i64>) -> serde_json::Value {
+    let token_ids: Vec<i64> = (block_hashes.iter())
+        .flat_map(|hash| [*hash, hash + 100])
+        .collect();
+    serde_json::json!({
+        "type": "BlockStored",
+        "block_hashes": block_hashes,
+        "parent_block_hash": parent_block_hash,
+        "token_ids": token_ids,
+        "block_size": 2,
+        "lora_id": null,
+        "medium": "GPU",
+        "session_id": "session",
+    })
+}
+
+/// Rank 0's snapshot once the blocks have followed the stream up to batch
+/// `next`, which they do on their own task: its stores and its end.
+async fn snapshot_at(
+    service: &KvEventsService,
+    next: u64,
+) -> Result<(Vec<pb::BlockStored>, pb::KvSnapshotEnd), Status> {
+    use pb::get_kv_snapshot_response::Item;
+    let followed = async {
+        loop {
+            let request = Request::new(pb::GetKvSnapshotRequest::default());
+            let mut responses = service.get_kv_snapshot(request).await?.into_inner();
+            let mut stored = Vec::new();
+            while let Some(response) = responses.next().await {
+                match response?.item.expect("an item") {
+                    Item::Blocks(blocks) => stored.extend(blocks.stored),
+                    Item::End(end) if end.resume.as_ref().unwrap().next_sequence_number == next => {
+                        assert!(responses.next().await.is_none(), "`end` is last");
+                        return Ok((stored, end));
+                    }
+                    Item::End(_) => tokio::time::sleep(Duration::from_millis(10)).await,
+                }
+            }
+        }
+    };
+    let followed = tokio::time::timeout(TIMEOUT, followed).await;
+    followed.unwrap_or_else(|_| panic!("no snapshot at batch {next} in time"))
 }
 
 /// Publish an empty batch until `stream` yields it. A PUB socket drops what
@@ -310,4 +361,78 @@ async fn kv_events_off_is_a_failed_precondition() {
     let service = KvEventsService::new(None, stopped);
     let status = subscribe(&service, None).await.err().expect("a status");
     assert_eq!(status.code(), tonic::Code::FailedPrecondition, "{status}");
+}
+
+#[tokio::test]
+async fn snapshot_holds_the_device_cache_and_joins_the_stream() {
+    let mut publisher = Publisher::bind().await;
+    // Two prompts share blocks 1 and 2, which the second stores again; then
+    // the second prompt's last block is evicted.
+    let prompts = [stored(&[1, 2, 3], None), stored(&[1, 2, 4, 5], None)];
+    publisher.buffer(0, batch(&prompts));
+    let evicted = serde_json::json!({"type": "BlockRemoved", "block_hashes": [5], "medium": "GPU"});
+    publisher.buffer(1, batch(&[evicted]));
+    let (service, stop) = service(&publisher);
+
+    let (snapshot, end) = snapshot_at(&service, 2).await.unwrap();
+    // The stores that recreate the held blocks, each after its parent, without the session.
+    let expected = [
+        stored(&[1, 2], None),
+        stored(&[3], Some(2)),
+        stored(&[4], Some(2)),
+    ];
+    let expected = wire::decode_batch(0, &batch(&expected)).unwrap().events;
+    let expected = expected.into_iter().map(|event| match event.event {
+        Some(pb::kv_cache_event::Event::BlockStored(store)) => pb::BlockStored {
+            session_id: None,
+            ..store
+        },
+        _ => unreachable!(),
+    });
+    assert_eq!(snapshot, expected.collect::<Vec<_>>());
+
+    // The stream continues where the snapshot ends.
+    let resume = end.resume.unwrap();
+    let resume = (resume.stream_id.as_str(), resume.next_sequence_number);
+    let (stream_id, mut stream) = subscribe(&service, Some(resume)).await.unwrap();
+    assert_eq!(stream_id, resume.0);
+    let next = publish_until_received(&mut publisher, 2, &mut stream).await;
+    assert_eq!(next.sequence_number, 2);
+
+    // A shutdown ends a snapshot that its client has not read.
+    let request = Request::new(pb::GetKvSnapshotRequest::default());
+    let mut unread = service.get_kv_snapshot(request).await.unwrap().into_inner();
+    stop.send(true).unwrap();
+    let status = unread.next().await.expect("a status").unwrap_err();
+    assert_eq!(status.code(), tonic::Code::Unavailable, "{status}");
+}
+
+#[tokio::test]
+async fn snapshot_is_incomplete_after_lost_batches_until_the_cache_is_cleared() {
+    let mut publisher = Publisher::bind().await;
+    publisher.buffer(0, batch(&[stored(&[1], None)]));
+    let (service, _stop) = service(&publisher);
+    assert!(snapshot_at(&service, 1).await.unwrap().1.complete);
+
+    // The publisher skipped batch 1, so the blocks cannot be followed to batch 2.
+    let (_, mut live) = subscribe(&service, None).await.unwrap();
+    publish_until_received(&mut publisher, 2, &mut live).await;
+    assert!(!snapshot_at(&service, 3).await.unwrap().1.complete);
+
+    let cleared = serde_json::json!({"type": "AllBlocksCleared"});
+    publisher.publish(3, batch(&[cleared])).await;
+    let (snapshot, end) = snapshot_at(&service, 4).await.unwrap();
+    assert!(snapshot.is_empty() && end.complete);
+}
+
+#[tokio::test]
+async fn snapshot_can_be_turned_off_and_the_stream_kept() {
+    let mut publisher = Publisher::bind().await;
+    publisher.config.grpc_snapshot = false;
+    let (service, _stop) = service(&publisher);
+    let status = snapshot_at(&service, 0).await.expect_err("a status");
+    assert_eq!(status.code(), tonic::Code::FailedPrecondition, "{status}");
+
+    let (_, mut stream) = subscribe(&service, None).await.unwrap();
+    publish_until_received(&mut publisher, 0, &mut stream).await;
 }

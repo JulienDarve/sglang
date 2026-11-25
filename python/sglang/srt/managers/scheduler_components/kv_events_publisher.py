@@ -16,6 +16,7 @@ import zmq
 from sglang.srt.disaggregation.kv_events import (
     EventPublisherFactory,
     KVEventBatch,
+    KVEventsConfig,
     is_kv_publisher_rank,
     select_kv_publisher_dp_rank,
 )
@@ -113,7 +114,11 @@ class SchedulerKvEventsPublisher:
     def local_kv_event_relay(self, block_size: int) -> Optional[dict[str, Any]]:
         if self.kv_event_publisher is None:
             return None
-        return self.kv_event_publisher.describe_local_relay(block_size)
+        relay = self.kv_event_publisher.describe_local_relay(block_size)
+        if relay is not None:
+            config = KVEventsConfig.from_cli(self.kv_events_config)
+            relay["grpc_snapshot"] = config.grpc_snapshot
+        return relay
 
     def publish_kv_events(self):
         if not self.enable_kv_cache_events:

@@ -88,6 +88,10 @@ sglang_kv_types = { package = "sglang-kv-types", path = "../sglang-kv-types" }
 # The KV event relay's SUB and DEALER sockets to the scheduler's publisher,
 # which binds them on private ipc:// addresses.
 zeromq = { version = "0.7", default-features = false, features = ["tokio-runtime", "ipc-transport"] }
+# Already in the tree; the KV snapshot's block index, and the encoded size of
+# its responses.
+rustc-hash = "2"
+prost = { workspace = true }
 
 # Hardware SHA-256 extensions; identical digests. sha2 0.10 compiles its
 # aarch64 backend only with `asm` (x86 already uses SHA-NI without it).

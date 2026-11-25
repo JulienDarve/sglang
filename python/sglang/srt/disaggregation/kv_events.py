@@ -762,6 +762,11 @@ class KVEventsConfig(BaseModel):
     and, for requests with mm_routing_labels, mm_routing_spans.
     """
 
+    grpc_snapshot: bool = True
+    """Whether the Rust server serves `GetKvSnapshot` on its gRPC port. It then
+    keeps the blocks of the device cache, with their token ids, in memory.
+    """
+
     @classmethod
     def from_cli(cls, cli_value: str) -> "KVEventsConfig":
         """Parse the CLI value for the event publisher config."""
@@ -798,6 +803,8 @@ class EventPublisherFactory:
         config_dict = config.model_dump()
         # The cache event recorder uses the format. The publisher does not accept it.
         config_dict.pop("format")
+        # The Rust server reads it, with the relay's addresses.
+        config_dict.pop("grpc_snapshot")
 
         kind = config_dict.pop("publisher", "null")
         if kind == "null":
