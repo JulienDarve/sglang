@@ -1,8 +1,10 @@
 # sglang-kv-types crate
 
 Rust bindings for SGLang's `sglang.kv.v1` API: the prost messages and the tonic
-client and server for `KvEvents`, which streams a scheduler's KV cache events
-with the same sequence numbers as its ZMQ publisher. The bindings are generated
+client and server for `KvEvents`. `SubscribeKvEvents` streams a scheduler's KV
+cache events with the same sequence numbers as its ZMQ publisher, and
+`GetKvSnapshot` returns the blocks its device cache holds, with the cursor to
+subscribe from. The bindings are generated
 from `proto/sglang/kv/v1` by `cargo gen-api` and checked in, so building the
 crate needs no `protoc` or build script. SGLang's own Rust server uses this same
 crate.

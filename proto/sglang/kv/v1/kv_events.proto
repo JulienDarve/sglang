@@ -25,6 +25,23 @@ service KvEvents {
   // UNAVAILABLE: the engine's replay socket did not answer, the relay
   //   stopped, or the server is shutting down.
   rpc SubscribeKvEvents(SubscribeKvEventsRequest) returns (stream SubscribeKvEventsResponse);
+
+  // Streams the blocks that this listener's rank holds in its device cache
+  // (medium `GPU`), as the stores that recreate them: applied in order to an
+  // empty state, they give the state after every batch before `end.resume`.
+  // A block follows its parent. A block whose parent is not held is left out,
+  // so a client that loaded the snapshot lacks it, also once the parent is
+  // stored again. The last response is `end`; a stream that ends without it
+  // is not a snapshot. To follow the cache from the snapshot, subscribe with
+  // `end.resume`, or subscribe before the call and drop the batches below
+  // `end.resume`: the snapshot holds every batch forwarded before the call.
+  //
+  // INVALID_ARGUMENT: this listener does not serve the rank.
+  // FAILED_PRECONDITION: the scheduler publishes no KV cache events over ZMQ,
+  //   or `grpc_snapshot` is false in its KV events config.
+  // UNAVAILABLE: the snapshot is behind the stream (retry), or the server is
+  //   shutting down.
+  rpc GetKvSnapshot(GetKvSnapshotRequest) returns (stream GetKvSnapshotResponse);
 }
 
 message SubscribeKvEventsRequest {
@@ -49,6 +66,31 @@ message SubscribeKvEventsResponse {
 message KvEventStreamStart {
   string stream_id = 1;                    // changes when the server restarts
   uint32 data_parallel_rank = 2;
+}
+
+message GetKvSnapshotRequest {
+  uint32 data_parallel_rank = 1;
+}
+
+message GetKvSnapshotResponse {
+  oneof item {
+    KvSnapshotBlocks blocks = 1;
+    KvSnapshotEnd end = 2;                 // always last
+  }
+}
+
+// `session_id` is never set on these stores: it describes a store event, not
+// a block.
+message KvSnapshotBlocks {
+  repeated BlockStored stored = 1;
+}
+
+// `complete` is false when the server missed batches, so the snapshot may lack
+// blocks the cache holds or hold blocks the cache dropped; it is true again
+// once the engine clears its cache.
+message KvSnapshotEnd {
+  KvEventCursor resume = 1;                // the first batch the snapshot does not include
+  bool complete = 2;
 }
 
 // Mirrors the engine's EventBatch: [ts, events, attn_dp_rank], plus the ZMQ sequence frame.

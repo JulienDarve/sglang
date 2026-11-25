@@ -2242,6 +2242,7 @@ mod tests {
                         block_size: 16,
                         endpoint: "ipc:///kv/events".into(),
                         replay_endpoint: "ipc:///kv/replay".into(),
+                        grpc_snapshot: true,
                     }),
                     ..Default::default()
                 },

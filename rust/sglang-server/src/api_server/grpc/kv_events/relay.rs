@@ -24,7 +24,7 @@ use crate::message::config::KvEventRelayConfig;
 /// publisher's replay buffer. Arbitrary.
 const LIVE_CAPACITY: usize = 1024;
 /// Pause after a failed read from the publisher. Arbitrary.
-const RETRY_DELAY: Duration = Duration::from_secs(1);
+pub(super) const RETRY_DELAY: Duration = Duration::from_secs(1);
 /// How long the publisher may take to send the next frame of a replay. Arbitrary.
 const REPLAY_TIMEOUT: Duration = Duration::from_secs(5);
 /// `ZmqEventPublisher.END_SEQ`, -1 as a big-endian i64: ends a replay.
@@ -48,6 +48,8 @@ pub(crate) struct KvEventRelay {
     pub(super) dp_rank: u32,
     /// Fixed for the life of the relay, which is that of the scheduler.
     pub(super) stream_id: String,
+    /// Whether `GetKvSnapshot` is served.
+    pub(super) grpc_snapshot: bool,
     live: broadcast::Sender<Arc<pb::KvEventBatch>>,
     /// The number after the last batch forwarded; `None` before the first.
     forwarded: watch::Receiver<Option<u64>>,
@@ -67,10 +69,16 @@ impl KvEventRelay {
         Self {
             dp_rank: config.dp_rank,
             stream_id: uuid::Uuid::new_v4().to_string(),
+            grpc_snapshot: config.grpc_snapshot,
             live,
             forwarded,
             replay_endpoint: config.replay_endpoint.as_str().into(),
         }
+    }
+
+    /// The relay's `forwarded`.
+    pub(super) fn forwarded(&self) -> Option<u64> {
+        *self.forwarded.borrow()
     }
 
     /// A reader of live batches, first replaying the publisher's buffered
@@ -172,6 +180,11 @@ pub(super) struct KvEventReader {
 }
 
 impl KvEventReader {
+    /// The reader's `next`.
+    pub(super) fn next_sequence_number(&self) -> Option<u64> {
+        self.next
+    }
+
     /// The next batch, each sequence number once and in order.
     pub(super) async fn next_batch(&mut self) -> Result<Arc<pb::KvEventBatch>, ReadError> {
         loop {

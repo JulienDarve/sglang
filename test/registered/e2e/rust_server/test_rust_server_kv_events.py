@@ -1,7 +1,9 @@
 """The Rust server's `sglang.kv.v1.KvEvents` stream on a real engine carries the
-scheduler's batches with the sequence numbers of its ZMQ endpoint."""
+scheduler's batches with the sequence numbers of its ZMQ endpoint, and its
+snapshot holds the blocks that the stream stored."""
 
 import json
+import time
 import unittest
 from typing import Optional
 
@@ -35,7 +37,11 @@ _MESSAGES = {
     "SubscribeKvEventsRequest": [("resume", 2, "KvEventCursor", False)],
     "KvEventStreamStart": [],
     "AllBlocksCleared": [],
-    "KvCacheEvent": [("all_blocks_cleared", 3, "AllBlocksCleared", False)],
+    "BlockStored": [("block_hashes", 1, _FIELD.TYPE_INT64, True)],
+    "KvCacheEvent": [
+        ("block_stored", 1, "BlockStored", False),
+        ("all_blocks_cleared", 3, "AllBlocksCleared", False),
+    ],
     "KvEventBatch": [
         ("sequence_number", 1, _FIELD.TYPE_UINT64, False),
         ("events", 4, "KvCacheEvent", True),
@@ -43,6 +49,16 @@ _MESSAGES = {
     "SubscribeKvEventsResponse": [
         ("start", 1, "KvEventStreamStart", False),
         ("batch", 2, "KvEventBatch", False),
+    ],
+    "GetKvSnapshotRequest": [],
+    "KvSnapshotBlocks": [("stored", 1, "BlockStored", True)],
+    "KvSnapshotEnd": [
+        ("resume", 1, "KvEventCursor", False),
+        ("complete", 2, _FIELD.TYPE_BOOL, False),
+    ],
+    "GetKvSnapshotResponse": [
+        ("blocks", 1, "KvSnapshotBlocks", False),
+        ("end", 2, "KvSnapshotEnd", False),
     ],
 }
 
@@ -77,7 +93,7 @@ def _message_classes() -> dict:
 
 
 class KvEventStream:
-    """`SubscribeKvEvents` on the Rust server's gRPC port."""
+    """`SubscribeKvEvents` and `GetKvSnapshot` on the Rust server's gRPC port."""
 
     def __init__(self, grpc_port: int):
         self.messages = _message_classes()
@@ -89,6 +105,11 @@ class KvEventStream:
             request_serializer=lambda request: request.SerializeToString(),
             response_deserializer=self.messages["SubscribeKvEventsResponse"].FromString,
         )
+        self._snapshot = self.channel.unary_stream(
+            "/sglang.kv.v1.KvEvents/GetKvSnapshot",
+            request_serializer=lambda request: request.SerializeToString(),
+            response_deserializer=self.messages["GetKvSnapshotResponse"].FromString,
+        )
 
     def subscribe(self, resume: Optional[int] = None):
         """Rank 0's responses; `resume` is a sequence number in the current stream."""
@@ -97,6 +118,18 @@ class KvEventStream:
             request.resume.SetInParent()
             request.resume.next_sequence_number = resume
         return self._subscribe(request, timeout=60)
+
+    def snapshot(self):
+        """Rank 0's snapshot: the hashes of its blocks, and its end."""
+        request = self.messages["GetKvSnapshotRequest"]()
+        *blocks, last = self._snapshot(request, timeout=60)
+        hashes = [
+            block_hash
+            for response in blocks
+            for stored in response.blocks.stored
+            for block_hash in stored.block_hashes
+        ]
+        return hashes, last.end
 
     def close(self) -> None:
         self.channel.close()
@@ -183,6 +216,25 @@ class TestRustServerKvEvents(CustomTestCase):
         self.assertTrue(next(resumed).HasField("start"))
         numbers = self._numbers_to_the_clear(resumed, cleared)
         self.assertEqual(numbers, list(range(cleared + 1)))
+
+        # The snapshot holds the blocks the stream stored since the clear, up
+        # to its cursor; the blocks follow the stream on their own task.
+        self._generate("The capital of Spain is Madrid. The capital of Peru is")
+        for _ in range(300):
+            snapshot, end = stream.snapshot()
+            if snapshot:
+                break
+            time.sleep(0.1)
+        else:
+            self.fail("the snapshot holds no block of the request")
+        self.assertTrue(end.complete)
+        stored = [
+            block_hash
+            for _ in range(cleared + 1, end.resume.next_sequence_number)
+            for event in next(resumed).batch.events
+            for block_hash in event.block_stored.block_hashes
+        ]
+        self.assertEqual(sorted(snapshot), sorted(stored))
 
 
 if __name__ == "__main__":

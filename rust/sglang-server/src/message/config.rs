@@ -687,6 +687,8 @@ pub struct KvEventRelayConfig {
     pub endpoint: String,
     /// The publisher's ROUTER replay socket.
     pub replay_endpoint: String,
+    /// `grpc_snapshot` of the KV events config: serve `GetKvSnapshot`.
+    pub grpc_snapshot: bool,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
