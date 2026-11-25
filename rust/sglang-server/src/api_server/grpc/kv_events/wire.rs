@@ -18,7 +18,7 @@ pub(super) fn decode_batch(
     Ok(pb::KvEventBatch {
         sequence_number,
         ts,
-        data_parallel_rank: attn_dp_rank,
+        attn_dp_rank,
         events: events.into_iter().map(Event::into_proto).collect(),
     })
 }
@@ -79,9 +79,8 @@ impl Event {
         let event = match self {
             Event::BlockStored(stored) => Proto::BlockStored(stored.into_proto()),
             Event::BlockRemoved(removed) => Proto::BlockRemoved(pb::BlockRemoved {
-                block_hashes: removed.block_hashes.into_iter().map(block_hash).collect(),
+                block_hashes: removed.block_hashes,
                 medium: removed.medium,
-                ..Default::default()
             }),
             Event::AllBlocksCleared => Proto::AllBlocksCleared(pb::AllBlocksCleared {}),
         };
@@ -91,11 +90,11 @@ impl Event {
 
 impl BlockStored {
     fn into_proto(self) -> pb::BlockStored {
-        let ids = match self.token_ids {
+        let token_ids = match self.token_ids {
             TokenIds::Single(token_ids) => {
-                pb::block_token_ids::Ids::Single(pb::TokenIdList { token_ids })
+                pb::block_stored::TokenIds::Single(pb::TokenIdList { token_ids })
             }
-            TokenIds::Pairs(pairs) => pb::block_token_ids::Ids::Pairs(pb::TokenIdPairList {
+            TokenIds::Pairs(pairs) => pb::block_stored::TokenIds::Pairs(pb::TokenIdPairList {
                 pairs: pairs
                     .into_iter()
                     .map(|(first, second)| pb::TokenIdPair { first, second })
@@ -104,15 +103,15 @@ impl BlockStored {
         };
         let mm_routing_spans = self.mm_routing_spans.unwrap_or_default().into_iter();
         pb::BlockStored {
-            block_hashes: self.block_hashes.into_iter().map(block_hash).collect(),
-            parent_block_hash: self.parent_block_hash.map(block_hash),
-            token_ids: Some(pb::BlockTokenIds { ids: Some(ids) }),
+            block_hashes: self.block_hashes,
+            parent_block_hash: self.parent_block_hash,
+            token_ids: Some(token_ids),
             block_size: self.block_size,
             lora_id: self.lora_id,
             medium: self.medium,
-            lora_name: self.lora_name,
-            session_id: self.session_id,
             cache_salt: self.cache_salt,
+            session_id: self.session_id,
+            lora_name: self.lora_name,
             mm_routing_spans: mm_routing_spans
                 .map(|spans| pb::BlockMmRoutingSpans {
                     spans: spans
@@ -126,13 +125,6 @@ impl BlockStored {
                         .collect(),
                 })
                 .collect(),
-            ..Default::default()
         }
-    }
-}
-
-fn block_hash(value: i64) -> pb::BlockHash {
-    pb::BlockHash {
-        value: Some(pb::block_hash::Value::SignedValue(value)),
     }
 }

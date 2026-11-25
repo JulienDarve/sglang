@@ -11,8 +11,7 @@ pub mod kv_events_client {
     use tonic::codegen::*;
     /// KV cache events of the scheduler, as its ZMQ publisher emits them
     /// (`python/sglang/srt/disaggregation/kv_events.py`), with the same sequence
-    /// numbers. The messages are shared with vLLM's `vllm` package so that one
-    /// client handles both engines; fields marked "vLLM" are never set by SGLang.
+    /// numbers.
     #[derive(Debug, Clone)]
     pub struct KvEventsClient<T> {
         inner: tonic::client::Grpc<T>,
@@ -177,8 +176,7 @@ pub mod kv_events_server {
     }
     /// KV cache events of the scheduler, as its ZMQ publisher emits them
     /// (`python/sglang/srt/disaggregation/kv_events.py`), with the same sequence
-    /// numbers. The messages are shared with vLLM's `vllm` package so that one
-    /// client handles both engines; fields marked "vLLM" are never set by SGLang.
+    /// numbers.
     #[derive(Debug)]
     pub struct KvEventsServer<T> {
         inner: Arc<T>,

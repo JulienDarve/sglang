@@ -41,7 +41,7 @@ pub struct KvEventStreamStart {
     #[prost(uint32, tag = "2")]
     pub data_parallel_rank: u32,
 }
-/// Mirrors the engine's EventBatch: \[ts, events, rank\], plus the ZMQ sequence frame.
+/// Mirrors the engine's EventBatch: \[ts, events, attn_dp_rank\], plus the ZMQ sequence frame.
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct KvEventBatch {
     /// the engine publisher's own number, same as on ZMQ
@@ -49,9 +49,8 @@ pub struct KvEventBatch {
     pub sequence_number: u64,
     #[prost(double, tag = "2")]
     pub ts: f64,
-    /// vLLM data_parallel_rank; SGLang attn_dp_rank
     #[prost(uint32, optional, tag = "3")]
-    pub data_parallel_rank: ::core::option::Option<u32>,
+    pub attn_dp_rank: ::core::option::Option<u32>,
     #[prost(message, repeated, tag = "4")]
     pub events: ::prost::alloc::vec::Vec<KvCacheEvent>,
 }
@@ -72,39 +71,42 @@ pub mod kv_cache_event {
         AllBlocksCleared(super::AllBlocksCleared),
     }
 }
-#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
-pub struct BlockHash {
-    #[prost(oneof = "block_hash::Value", tags = "1, 2, 3")]
-    pub value: ::core::option::Option<block_hash::Value>,
-}
-/// Nested message and enum types in `BlockHash`.
-pub mod block_hash {
-    #[derive(Clone, PartialEq, Eq, Hash, ::prost::Oneof)]
-    pub enum Value {
-        /// vLLM integer hashes (default)
-        #[prost(uint64, tag = "1")]
-        UnsignedValue(u64),
-        /// SGLang
-        #[prost(int64, tag = "2")]
-        SignedValue(i64),
-        /// vLLM with integer hashes turned off
-        #[prost(bytes, tag = "3")]
-        Digest(::prost::alloc::vec::Vec<u8>),
-    }
-}
 #[derive(Clone, PartialEq, ::prost::Message)]
-pub struct BlockTokenIds {
-    #[prost(oneof = "block_token_ids::Ids", tags = "1, 2")]
-    pub ids: ::core::option::Option<block_token_ids::Ids>,
+pub struct BlockStored {
+    #[prost(int64, repeated, tag = "1")]
+    pub block_hashes: ::prost::alloc::vec::Vec<i64>,
+    /// unset for a root block
+    #[prost(int64, optional, tag = "2")]
+    pub parent_block_hash: ::core::option::Option<i64>,
+    #[prost(uint32, tag = "5")]
+    pub block_size: u32,
+    /// deprecated
+    #[prost(int64, optional, tag = "6")]
+    pub lora_id: ::core::option::Option<i64>,
+    #[prost(string, optional, tag = "7")]
+    pub medium: ::core::option::Option<::prost::alloc::string::String>,
+    #[prost(string, optional, tag = "8")]
+    pub cache_salt: ::core::option::Option<::prost::alloc::string::String>,
+    #[prost(string, optional, tag = "9")]
+    pub session_id: ::core::option::Option<::prost::alloc::string::String>,
+    #[prost(string, optional, tag = "10")]
+    pub lora_name: ::core::option::Option<::prost::alloc::string::String>,
+    /// one per block
+    #[prost(message, repeated, tag = "11")]
+    pub mm_routing_spans: ::prost::alloc::vec::Vec<BlockMmRoutingSpans>,
+    /// flat across all blocks in the event
+    #[prost(oneof = "block_stored::TokenIds", tags = "3, 4")]
+    pub token_ids: ::core::option::Option<block_stored::TokenIds>,
 }
-/// Nested message and enum types in `BlockTokenIds`.
-pub mod block_token_ids {
+/// Nested message and enum types in `BlockStored`.
+pub mod block_stored {
+    /// flat across all blocks in the event
     #[derive(Clone, PartialEq, ::prost::Oneof)]
-    pub enum Ids {
-        #[prost(message, tag = "1")]
+    pub enum TokenIds {
+        #[prost(message, tag = "3")]
         Single(super::TokenIdList),
-        /// SGLang EAGLE pages
-        #[prost(message, tag = "2")]
+        /// EAGLE pages: \[token, next token\]
+        #[prost(message, tag = "4")]
         Pairs(super::TokenIdPairList),
     }
 }
@@ -125,104 +127,15 @@ pub struct TokenIdPair {
     #[prost(uint64, tag = "2")]
     pub second: u64,
 }
-#[derive(Clone, PartialEq, ::prost::Message)]
-pub struct BlockStored {
-    #[prost(message, repeated, tag = "1")]
-    pub block_hashes: ::prost::alloc::vec::Vec<BlockHash>,
-    /// unset for a root block
-    #[prost(message, optional, tag = "2")]
-    pub parent_block_hash: ::core::option::Option<BlockHash>,
-    /// flat across all blocks in the event
-    #[prost(message, optional, tag = "3")]
-    pub token_ids: ::core::option::Option<BlockTokenIds>,
-    #[prost(uint32, tag = "4")]
-    pub block_size: u32,
-    /// deprecated in both engines, kept for parity
-    #[prost(int64, optional, tag = "5")]
-    pub lora_id: ::core::option::Option<i64>,
-    #[prost(string, optional, tag = "6")]
-    pub medium: ::core::option::Option<::prost::alloc::string::String>,
-    #[prost(string, optional, tag = "7")]
-    pub lora_name: ::core::option::Option<::prost::alloc::string::String>,
-    #[prost(string, optional, tag = "8")]
-    pub session_id: ::core::option::Option<::prost::alloc::string::String>,
-    /// SGLang
-    #[prost(string, optional, tag = "9")]
-    pub cache_salt: ::core::option::Option<::prost::alloc::string::String>,
-    /// SGLang, one per block
-    #[prost(message, repeated, tag = "10")]
-    pub mm_routing_spans: ::prost::alloc::vec::Vec<BlockMmRoutingSpans>,
-    /// vLLM, one per block
-    #[prost(message, repeated, tag = "11")]
-    pub extra_keys: ::prost::alloc::vec::Vec<BlockExtraKeys>,
-    /// vLLM
-    #[prost(uint32, optional, tag = "12")]
-    pub group_idx: ::core::option::Option<u32>,
-    /// vLLM
-    #[prost(string, optional, tag = "13")]
-    pub kv_cache_spec_kind: ::core::option::Option<::prost::alloc::string::String>,
-    /// vLLM
-    #[prost(uint32, optional, tag = "14")]
-    pub kv_cache_spec_sliding_window: ::core::option::Option<u32>,
-    /// vLLM
-    #[prost(string, optional, tag = "15")]
-    pub locality: ::core::option::Option<::prost::alloc::string::String>,
-    /// vLLM
-    #[prost(string, optional, tag = "16")]
-    pub ownership: ::core::option::Option<::prost::alloc::string::String>,
-    /// vLLM, one per block
-    #[prost(message, repeated, tag = "17")]
-    pub lookahead_token_ids: ::prost::alloc::vec::Vec<TokenIdList>,
-}
-#[derive(Clone, PartialEq, ::prost::Message)]
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct BlockRemoved {
-    #[prost(message, repeated, tag = "1")]
-    pub block_hashes: ::prost::alloc::vec::Vec<BlockHash>,
+    #[prost(int64, repeated, tag = "1")]
+    pub block_hashes: ::prost::alloc::vec::Vec<i64>,
     #[prost(string, optional, tag = "2")]
     pub medium: ::core::option::Option<::prost::alloc::string::String>,
-    /// vLLM
-    #[prost(uint32, optional, tag = "3")]
-    pub group_idx: ::core::option::Option<u32>,
-    /// vLLM
-    #[prost(string, optional, tag = "4")]
-    pub locality: ::core::option::Option<::prost::alloc::string::String>,
-    /// vLLM
-    #[prost(string, optional, tag = "5")]
-    pub ownership: ::core::option::Option<::prost::alloc::string::String>,
 }
 #[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct AllBlocksCleared {}
-/// vLLM extra_keys, untagged as published: LoRA name, (mm_identifier, offset),
-/// cache salt, prompt-embedding digests.
-#[derive(Clone, PartialEq, ::prost::Message)]
-pub struct BlockExtraKeys {
-    #[prost(message, repeated, tag = "1")]
-    pub keys: ::prost::alloc::vec::Vec<ExtraKeyValue>,
-}
-#[derive(Clone, PartialEq, ::prost::Message)]
-pub struct ExtraKeyValue {
-    #[prost(oneof = "extra_key_value::Value", tags = "1, 2, 3, 4")]
-    pub value: ::core::option::Option<extra_key_value::Value>,
-}
-/// Nested message and enum types in `ExtraKeyValue`.
-pub mod extra_key_value {
-    #[derive(Clone, PartialEq, ::prost::Oneof)]
-    pub enum Value {
-        #[prost(string, tag = "1")]
-        Text(::prost::alloc::string::String),
-        #[prost(bytes, tag = "2")]
-        Data(::prost::alloc::vec::Vec<u8>),
-        #[prost(int64, tag = "3")]
-        Integer(i64),
-        #[prost(message, tag = "4")]
-        Tuple(super::ExtraKeyTuple),
-    }
-}
-#[derive(Clone, PartialEq, ::prost::Message)]
-pub struct ExtraKeyTuple {
-    #[prost(message, repeated, tag = "1")]
-    pub items: ::prost::alloc::vec::Vec<ExtraKeyValue>,
-}
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct BlockMmRoutingSpans {
     #[prost(message, repeated, tag = "1")]
