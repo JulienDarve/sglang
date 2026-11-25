@@ -29,13 +29,16 @@ const SNAPSHOT_RESPONSES_AHEAD: usize = 2;
 /// How long a client may take to read a snapshot response before the snapshot
 /// is dropped. Arbitrary.
 const SNAPSHOT_READ_TIMEOUT: Duration = Duration::from_secs(30);
+/// How long a snapshot waits for the blocks to hold every batch the relay has
+/// forwarded. Arbitrary.
+const SNAPSHOT_FOLD_TIMEOUT: Duration = Duration::from_secs(5);
 
 pub(crate) struct KvEventsService {
     /// `None` when this listener's scheduler publishes no KV events over ZMQ.
     relay: Option<Arc<KvEventRelay>>,
-    /// The device cache's blocks, kept by `follow_blocks`; `None` when
-    /// `grpc_snapshot` is false.
-    blocks: Option<Arc<Mutex<Blocks>>>,
+    /// The device cache's blocks, kept by `follow_blocks`, and the number after
+    /// the last batch folded into them; `None` when `grpc_snapshot` is false.
+    blocks: Option<(Arc<Mutex<Blocks>>, watch::Receiver<u64>)>,
     /// Held while a snapshot is sent: each holds a copy of `blocks`.
     snapshot_gate: Arc<tokio::sync::Mutex<()>>,
     /// Turns true to end every stream, which a graceful shutdown would
@@ -50,8 +53,9 @@ impl KvEventsService {
         let snapshot_relay = relay.as_ref().filter(|relay| relay.grpc_snapshot);
         let blocks = snapshot_relay.map(|relay| {
             let blocks = Arc::<Mutex<Blocks>>::default();
-            tokio::spawn(follow_blocks(relay.clone(), blocks.clone()));
-            blocks
+            let (folded, folded_to) = watch::channel(0);
+            tokio::spawn(follow_blocks(relay.clone(), blocks.clone(), folded));
+            (blocks, folded_to)
         });
         Self {
             relay,
@@ -108,11 +112,23 @@ impl KvEvents for KvEventsService {
         request: Request<pb::GetKvSnapshotRequest>,
     ) -> Result<Response<Self::GetKvSnapshotStream>, Status> {
         let relay = self.relay_for(request.into_inner().data_parallel_rank)?;
-        let blocks = self.blocks.clone().ok_or_else(|| {
+        let (blocks, mut folded_to) = self.blocks.clone().ok_or_else(|| {
             Status::failed_precondition(
                 "KV cache snapshots are off: `grpc_snapshot` is false in --kv-events-config",
             )
         })?;
+        // A client that subscribed before this call drops the batches below the
+        // cursor, so the snapshot must hold every batch forwarded by now.
+        let forwarded = relay.forwarded().unwrap_or(0);
+        let caught_up = folded_to.wait_for(|folded_to| *folded_to >= forwarded);
+        if !matches!(
+            tokio::time::timeout(SNAPSHOT_FOLD_TIMEOUT, caught_up).await,
+            Ok(Ok(_))
+        ) {
+            return Err(Status::unavailable(
+                "the KV cache snapshot is behind the KV event stream; retry",
+            ));
+        }
         let gate = self.snapshot_gate.clone().lock_owned().await;
         let stream_id = relay.stream_id.clone();
         let (built, received) = mpsc::channel(SNAPSHOT_RESPONSES_AHEAD);
@@ -138,7 +154,13 @@ impl KvEvents for KvEventsService {
 }
 
 /// Keeps `blocks` in step with the relay's batches, from the first.
-async fn follow_blocks(relay: Arc<KvEventRelay>, blocks: Arc<Mutex<Blocks>>) {
+async fn follow_blocks(
+    relay: Arc<KvEventRelay>,
+    blocks: Arc<Mutex<Blocks>>,
+    folded: watch::Sender<u64>,
+) {
+    // As the blocks' cursor: it never moves back.
+    let folded_to = |next: u64| folded.send_modify(|folded_to| *folded_to = (*folded_to).max(next));
     // The batch to read on from; `None` once the batches before the live ones are lost.
     let mut next = Some(0);
     loop {
@@ -152,16 +174,20 @@ async fn follow_blocks(relay: Arc<KvEventRelay>, blocks: Arc<Mutex<Blocks>>) {
                 tracing::warn!(
                     "lost KV event batches; snapshots are incomplete until the cache is cleared"
                 );
-                lock(&blocks).lost(reader.next_sequence_number().unwrap_or(0));
+                let live = reader.next_sequence_number().unwrap_or(0);
+                lock(&blocks).lost(live);
+                folded_to(live);
             }
             loop {
                 let batch = reader.next_batch().await?;
-                next = Some(batch.sequence_number + 1);
+                let after = batch.sequence_number + 1;
+                next = Some(after);
                 // The fold walks every block of the batch: keep it off the API
                 // runtime. One that does not finish leaves the blocks unknown.
                 let blocks = blocks.clone();
                 let fold = tokio::task::spawn_blocking(move || lock(&blocks).apply(&batch));
                 fold.await.map_err(|_| ReadError::DataLoss)?;
+                folded_to(after);
             }
         }
         .await;

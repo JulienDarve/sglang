@@ -166,28 +166,36 @@ fn stored(block_hashes: &[i64], parent_block_hash: Option<i64>) -> serde_json::V
     })
 }
 
-/// Rank 0's snapshot once the blocks have followed the stream up to batch
-/// `next`, which they do on their own task: its stores and its end.
-async fn snapshot_at(
-    service: &KvEventsService,
-    next: u64,
-) -> Result<(Vec<pb::BlockStored>, pb::KvSnapshotEnd), Status> {
+type Snapshot = (Vec<pb::BlockStored>, pb::KvSnapshotEnd);
+
+/// Rank 0's snapshot: its stores and its end.
+async fn snapshot(service: &KvEventsService) -> Result<Snapshot, Status> {
     use pb::get_kv_snapshot_response::Item;
+    let request = Request::new(pb::GetKvSnapshotRequest::default());
+    let mut responses = service.get_kv_snapshot(request).await?.into_inner();
+    let mut stored = Vec::new();
+    loop {
+        match responses.next().await.expect("an end")?.item {
+            Some(Item::Blocks(blocks)) => stored.extend(blocks.stored),
+            Some(Item::End(end)) => {
+                assert!(responses.next().await.is_none(), "`end` is last");
+                return Ok((stored, end));
+            }
+            None => panic!("a response without an item"),
+        }
+    }
+}
+
+/// The snapshot once the blocks have followed the stream up to batch `next`:
+/// they follow a replay on their own task.
+async fn snapshot_at(service: &KvEventsService, next: u64) -> Result<Snapshot, Status> {
     let followed = async {
         loop {
-            let request = Request::new(pb::GetKvSnapshotRequest::default());
-            let mut responses = service.get_kv_snapshot(request).await?.into_inner();
-            let mut stored = Vec::new();
-            while let Some(response) = responses.next().await {
-                match response?.item.expect("an item") {
-                    Item::Blocks(blocks) => stored.extend(blocks.stored),
-                    Item::End(end) if end.resume.as_ref().unwrap().next_sequence_number == next => {
-                        assert!(responses.next().await.is_none(), "`end` is last");
-                        return Ok((stored, end));
-                    }
-                    Item::End(_) => tokio::time::sleep(Duration::from_millis(10)).await,
-                }
+            let (stored, end) = snapshot(service).await?;
+            if end.resume.as_ref().unwrap().next_sequence_number == next {
+                return Ok((stored, end));
             }
+            tokio::time::sleep(Duration::from_millis(10)).await;
         }
     };
     let followed = tokio::time::timeout(TIMEOUT, followed).await;
@@ -405,6 +413,34 @@ async fn snapshot_holds_the_device_cache_and_joins_the_stream() {
     stop.send(true).unwrap();
     let status = unread.next().await.expect("a status").unwrap_err();
     assert_eq!(status.code(), tonic::Code::Unavailable, "{status}");
+}
+
+#[tokio::test]
+async fn snapshot_waits_for_the_batches_a_subscriber_has_received() {
+    let mut publisher = Publisher::bind().await;
+    let (service, _stop) = service(&publisher);
+    let (_, mut live) = subscribe(&service, None).await.unwrap();
+    // Stall the fold. Sent once the blocks are locked, and again to unlock them.
+    let blocks = service.blocks.clone().unwrap().0;
+    let (hold, held) = std::sync::mpsc::sync_channel(0);
+    std::thread::spawn(move || {
+        let _blocks = blocks.lock().unwrap();
+        hold.send(()).and_then(|()| hold.send(()))
+    });
+    held.recv().unwrap();
+    publish_until_received(&mut publisher, 0, &mut live).await;
+
+    // A client that subscribed first drops the batches below the cursor, so
+    // the snapshot is not cut before the blocks hold batch 0.
+    let request = Request::new(pb::GetKvSnapshotRequest::default());
+    let early = tokio::time::timeout(Duration::from_millis(100), service.get_kv_snapshot(request));
+    assert!(
+        early.await.is_err(),
+        "the snapshot did not wait for batch 0"
+    );
+    held.recv().unwrap();
+    let (_, end) = snapshot(&service).await.unwrap();
+    assert_eq!(end.resume.unwrap().next_sequence_number, 1);
 }
 
 #[tokio::test]

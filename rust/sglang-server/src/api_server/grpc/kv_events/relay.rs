@@ -76,6 +76,11 @@ impl KvEventRelay {
         }
     }
 
+    /// The relay's `forwarded`.
+    pub(super) fn forwarded(&self) -> Option<u64> {
+        *self.forwarded.borrow()
+    }
+
     /// A reader of live batches, first replaying the publisher's buffered
     /// batches from `resume` when given.
     pub(super) async fn reader(

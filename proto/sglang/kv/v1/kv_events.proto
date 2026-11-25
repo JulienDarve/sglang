@@ -34,12 +34,14 @@ service KvEvents {
   // so a client that loaded the snapshot lacks it, also once the parent is
   // stored again. The last response is `end`; a stream that ends without it
   // is not a snapshot. To follow the cache from the snapshot, subscribe with
-  // `end.resume`.
+  // `end.resume`, or subscribe before the call and drop the batches below
+  // `end.resume`: the snapshot holds every batch forwarded before the call.
   //
   // INVALID_ARGUMENT: this listener does not serve the rank.
   // FAILED_PRECONDITION: the scheduler publishes no KV cache events over ZMQ,
   //   or `grpc_snapshot` is false in its KV events config.
-  // UNAVAILABLE: the server is shutting down.
+  // UNAVAILABLE: the snapshot is behind the stream (retry), or the server is
+  //   shutting down.
   rpc GetKvSnapshot(GetKvSnapshotRequest) returns (stream GetKvSnapshotResponse);
 }
 
