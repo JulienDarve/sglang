@@ -55,11 +55,6 @@ impl<T: Clone> Ledger<T> {
         Some(&self.slots[at as usize].1.content)
     }
 
-    pub fn get_mut(&mut self, hash: u64) -> Option<&mut T> {
-        let at = *self.index.get(&hash)?;
-        Some(&mut self.slots[at as usize].1.content)
-    }
-
     /// Records `hash` as held. The first store of a block fixes its `content` and `parent`.
     pub fn store(&mut self, hash: u64, content: T, parent: Option<u64>) {
         if let Entry::Vacant(slot) = self.index.entry(hash) {

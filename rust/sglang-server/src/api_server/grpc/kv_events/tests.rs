@@ -228,7 +228,7 @@ async fn publish_until_received(
 /// sends for it (`testdata/kv_event_batch.hex`, which `test_kv_events.py`
 /// compares with msgspec's encoding), and the message the stream carries.
 fn batch_with_every_field() -> (Bytes, pb::KvEventBatch) {
-    use pb::block_token_ids::Ids;
+    use pb::block_stored::TokenIds;
     use pb::kv_cache_event::Event;
 
     let payload = include_str!("../../../../testdata/kv_event_batch.hex").trim();
@@ -237,10 +237,6 @@ fn batch_with_every_field() -> (Bytes, pb::KvEventBatch) {
         .map(|i| u8::from_str_radix(&payload[i..i + 2], 16).unwrap())
         .collect();
 
-    let hash = |value| pb::BlockHash {
-        value: Some(pb::block_hash::Value::SignedValue(value)),
-    };
-    let token_ids = |ids| Some(pb::BlockTokenIds { ids: Some(ids) });
     let image = pb::MmRoutingSpan {
         start: 0,
         length: 1,
@@ -248,27 +244,26 @@ fn batch_with_every_field() -> (Bytes, pb::KvEventBatch) {
     };
     let events = vec![
         Event::BlockStored(pb::BlockStored {
-            block_hashes: vec![hash(-7), hash(1 << 62)],
-            parent_block_hash: Some(hash(-1)),
-            token_ids: token_ids(Ids::Single(pb::TokenIdList {
+            block_hashes: vec![-7, 1 << 62],
+            parent_block_hash: Some(-1),
+            token_ids: Some(TokenIds::Single(pb::TokenIdList {
                 token_ids: vec![1, 2, 1 << 40, 3],
             })),
             block_size: 2,
             lora_id: Some(5),
             medium: Some("CPU_PINNED".into()),
-            lora_name: Some("adapter".into()),
-            session_id: Some("session".into()),
             cache_salt: Some("salt".into()),
+            session_id: Some("session".into()),
+            lora_name: Some("adapter".into()),
             mm_routing_spans: vec![
                 pb::BlockMmRoutingSpans { spans: vec![image] },
                 pb::BlockMmRoutingSpans { spans: vec![] },
             ],
-            ..Default::default()
         }),
         // An EAGLE page: `[token, next token]` pairs, and no parent.
         Event::BlockStored(pb::BlockStored {
-            block_hashes: vec![hash(11)],
-            token_ids: token_ids(Ids::Pairs(pb::TokenIdPairList {
+            block_hashes: vec![11],
+            token_ids: Some(TokenIds::Pairs(pb::TokenIdPairList {
                 pairs: [(1, 2), (2, 3)]
                     .map(|(first, second)| pb::TokenIdPair { first, second })
                     .into(),
@@ -277,16 +272,15 @@ fn batch_with_every_field() -> (Bytes, pb::KvEventBatch) {
             ..Default::default()
         }),
         Event::BlockRemoved(pb::BlockRemoved {
-            block_hashes: vec![hash(-7)],
+            block_hashes: vec![-7],
             medium: Some("GPU".into()),
-            ..Default::default()
         }),
         Event::AllBlocksCleared(pb::AllBlocksCleared {}),
     ];
     let streamed = pb::KvEventBatch {
         sequence_number: 0,
         ts: 1.5,
-        data_parallel_rank: Some(3),
+        attn_dp_rank: Some(3),
         events: events
             .into_iter()
             .map(|event| pb::KvCacheEvent { event: Some(event) })

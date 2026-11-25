@@ -37,8 +37,7 @@ _MESSAGES = {
     "SubscribeKvEventsRequest": [("resume", 2, "KvEventCursor", False)],
     "KvEventStreamStart": [],
     "AllBlocksCleared": [],
-    "BlockHash": [("signed_value", 2, _FIELD.TYPE_INT64, False)],
-    "BlockStored": [("block_hashes", 1, "BlockHash", True)],
+    "BlockStored": [("block_hashes", 1, _FIELD.TYPE_INT64, True)],
     "KvCacheEvent": [
         ("block_stored", 1, "BlockStored", False),
         ("all_blocks_cleared", 3, "AllBlocksCleared", False),
@@ -125,7 +124,7 @@ class KvEventStream:
         request = self.messages["GetKvSnapshotRequest"]()
         *blocks, last = self._snapshot(request, timeout=60)
         hashes = [
-            block_hash.signed_value
+            block_hash
             for response in blocks
             for stored in response.blocks.stored
             for block_hash in stored.block_hashes
@@ -230,7 +229,7 @@ class TestRustServerKvEvents(CustomTestCase):
             self.fail("the snapshot holds no block of the request")
         self.assertTrue(end.complete)
         stored = [
-            block_hash.signed_value
+            block_hash
             for _ in range(cleared + 1, end.resume.next_sequence_number)
             for event in next(resumed).batch.events
             for block_hash in event.block_stored.block_hashes

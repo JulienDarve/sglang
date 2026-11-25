@@ -1,8 +1,7 @@
-//! The blocks one rank's device cache holds, folded from its KV event batches, and the
+//! The blocks the scheduler's device cache holds, folded from its KV event batches, and the
 //! snapshots of them.
 
 use std::borrow::Cow;
-use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use prost::Message as _;
@@ -11,14 +10,10 @@ use rustc_hash::FxHashMap;
 
 use super::ledger::Ledger;
 use super::pb;
-use super::pb::block_token_ids::Ids;
+use super::pb::block_stored::TokenIds as Ids;
 
 /// The medium of the device cache, the only tier tracked.
 const DEVICE_MEDIUM: &str = "GPU";
-/// Whether a second store of a held block adds a copy with a remove of its own. Not in
-/// SGLang: a second store of a held page changes nothing and one remove drops it, the rule
-/// Dynamo's SGLang path applies.
-const COUNTS_COPIES: bool = false;
 /// Encoded size at which a snapshot response is sent. Arbitrary; gRPC's default limit is 4 MiB.
 const RESPONSE_BYTES: usize = 1 << 20;
 /// The most blocks and token ids in one store of a snapshot, which keep a store well under
@@ -26,20 +21,10 @@ const RESPONSE_BYTES: usize = 1 << 20;
 const STORE_BLOCKS: usize = 1024;
 const STORE_TOKEN_IDS: usize = 1 << 16;
 
-/// Where blocks are held, as a remove names it besides its medium:
-/// `(group_idx, locality, ownership)`.
-type Place = (Option<u32>, Option<String>, Option<String>);
-
-fn place(group_idx: Option<u32>, locality: &Option<String>, ownership: &Option<String>) -> Place {
-    (group_idx, locality.clone(), ownership.clone())
-}
-
 /// What a store said about one of its blocks.
 struct StoredBlock {
-    hash: pb::BlockHash,
+    hash: i64,
     token_ids: TokenIds,
-    /// `None` when the store has no lookahead tokens.
-    lookahead_token_ids: Option<TokenIds>,
     /// Everything else; see [`rest_of`].
     rest: Arc<pb::BlockStored>,
 }
@@ -60,17 +45,13 @@ impl TokenIds {
     }
 }
 
-#[derive(Clone)]
-struct Held {
-    block: Arc<StoredBlock>,
-    /// How many blocks of the cache hold it.
-    copies: u32,
-}
-
-/// The blocks one rank's device cache holds, as of the batch before `next`.
+/// The blocks the device cache holds, as of the batch before `next`.
+///
+/// A block is held or it is not: a second store of a held page changes nothing and one remove
+/// drops it, the rule Dynamo's SGLang path applies.
 #[derive(Default)]
 pub(super) struct Blocks {
-    places: BTreeMap<Place, Ledger<Held>>,
+    held: Ledger<Arc<StoredBlock>>,
     rests: Rests,
     next: u64,
     /// Batches were lost since the cache was last empty.
@@ -91,7 +72,7 @@ impl Blocks {
                 Some(Event::BlockStored(stored)) => self.store(stored),
                 Some(Event::BlockRemoved(removed)) => self.remove(removed),
                 Some(Event::AllBlocksCleared(_)) => {
-                    self.places.clear();
+                    self.held = Ledger::default();
                     self.incomplete = false;
                 }
                 None => {}
@@ -108,16 +89,15 @@ impl Blocks {
     }
 
     /// The responses of a snapshot of the blocks held now, `end` last. Taking it copies the
-    /// ledgers and shares the blocks, so it can be done under the lock that `apply` takes;
-    /// the responses walk every block, so read them off the threads that serve requests.
+    /// ledger and shares the blocks, so it can be done under the lock that `apply` takes;
+    /// the responses walk every block, so read them off the API runtime.
     pub fn snapshot(
         &self,
         stream_id: String,
     ) -> impl Iterator<Item = pb::GetKvSnapshotResponse> + Send + use<> {
         use pb::get_kv_snapshot_response::Item;
 
-        let ledgers: Vec<_> = self.places.values().cloned().collect();
-        let mut left = ledgers.into_iter().flat_map(stores);
+        let mut left = std::iter::once(self.held.clone()).flat_map(stores);
         let mut end = Some(pb::KvSnapshotEnd {
             resume: Some(pb::KvEventCursor {
                 stream_id,
@@ -144,15 +124,11 @@ impl Blocks {
     }
 
     fn store(&mut self, stored: &pb::BlockStored) {
-        if stored.reuse_report || stored.medium.as_deref() != Some(DEVICE_MEDIUM) {
+        if stored.medium.as_deref() != Some(DEVICE_MEDIUM) {
             return;
         }
         // The ids flat, and the form the store gave them in, without them.
-        let ids = stored
-            .token_ids
-            .as_ref()
-            .and_then(|token_ids| token_ids.ids.as_ref());
-        let (ids, form): (Cow<[u64]>, Ids) = match ids {
+        let (ids, form): (Cow<[u64]>, Ids) = match &stored.token_ids {
             Some(Ids::Single(list)) => ((&list.token_ids).into(), Ids::Single(Default::default())),
             Some(Ids::Pairs(list)) => {
                 let ids = list.pairs.iter().flat_map(|pair| [pair.first, pair.second]);
@@ -161,41 +137,30 @@ impl Blocks {
             None => return,
         };
         let size = stored.block_size as usize * if matches!(form, Ids::Pairs(_)) { 2 } else { 1 };
-        // The engine leaves null and masked blocks out of the hashes but not out of the
-        // tokens: such a store's tokens cannot be told apart per block.
+        // The recorder stores `block_size` tokens per block; otherwise the tokens cannot be
+        // told apart per block.
         if size == 0 || ids.len() != stored.block_hashes.len() * size {
             return;
         }
 
-        let place = place(stored.group_idx, &stored.locality, &stored.ownership);
-        let ledger = self.places.entry(place).or_default();
-        // The same for every block of the store, unless they have entries of their own.
-        let per_block = !stored.extra_keys.is_empty() || !stored.mm_routing_spans.is_empty();
+        // The same for every block of the store, unless they have spans of their own.
+        let per_block = !stored.mm_routing_spans.is_empty();
         let mut of_store: Option<Arc<pb::BlockStored>> = None;
-        let mut parent = stored.parent_block_hash.as_ref().map(hash_key);
-        for (at, hash) in stored.block_hashes.iter().enumerate() {
-            let key = hash_key(hash);
-            match ledger.get_mut(key) {
-                Some(held) => held.copies += u32::from(COUNTS_COPIES),
-                None => {
-                    let rest = match &of_store {
-                        Some(rest) if !per_block => rest.clone(),
-                        _ => self.rests.shared(rest_of(stored, at, &form)),
-                    };
-                    of_store = Some(rest.clone());
-                    let lookahead = stored.lookahead_token_ids.get(at);
-                    let block = StoredBlock {
-                        hash: hash.clone(),
-                        token_ids: TokenIds::new(&ids[at * size..][..size]),
-                        lookahead_token_ids: lookahead.map(|list| TokenIds::new(&list.token_ids)),
-                        rest,
-                    };
-                    let held = Held {
-                        block: Arc::new(block),
-                        copies: 1,
-                    };
-                    ledger.store(key, held, parent);
-                }
+        let mut parent = stored.parent_block_hash.map(i64::cast_unsigned);
+        for (at, &hash) in stored.block_hashes.iter().enumerate() {
+            let key = hash.cast_unsigned();
+            if self.held.get(key).is_none() {
+                let rest = match &of_store {
+                    Some(rest) if !per_block => rest.clone(),
+                    _ => self.rests.shared(rest_of(stored, at, &form)),
+                };
+                of_store = Some(rest.clone());
+                let block = StoredBlock {
+                    hash,
+                    token_ids: TokenIds::new(&ids[at * size..][..size]),
+                    rest,
+                };
+                self.held.store(key, Arc::new(block), parent);
             }
             parent = Some(key);
         }
@@ -205,73 +170,37 @@ impl Blocks {
         if removed.medium.as_deref() != Some(DEVICE_MEDIUM) {
             return;
         }
-        let place = place(removed.group_idx, &removed.locality, &removed.ownership);
-        let Some(ledger) = self.places.get_mut(&place) else {
-            return;
-        };
         for hash in &removed.block_hashes {
-            let key = hash_key(hash);
-            match ledger.get_mut(key) {
-                Some(held) if held.copies > 1 => held.copies -= 1,
-                _ => {
-                    ledger.remove(key);
-                }
-            }
+            self.held.remove(hash.cast_unsigned());
         }
-    }
-}
-
-/// A hash as a ledger key. A digest is keyed by its low 64 bits, the integer the engine
-/// publishes for it by default.
-fn hash_key(hash: &pb::BlockHash) -> u64 {
-    use pb::block_hash::Value;
-
-    match &hash.value {
-        Some(Value::UnsignedValue(value)) => *value,
-        Some(Value::SignedValue(value)) => value.cast_unsigned(),
-        Some(Value::Digest(digest)) => {
-            let low = &digest[digest.len().saturating_sub(8)..];
-            low.iter().fold(0, |key, &byte| key << 8 | u64::from(byte))
-        }
-        None => 0,
     }
 }
 
 /// What `stored` says about its block `at` besides its hash, parent and tokens: the fields
-/// of the whole store, and the block's entries of `extra_keys` and `mm_routing_spans`. Its
-/// `token_ids` are `form`, and it has no `session_id`, which describes the event.
+/// of the whole store, and the block's entry of `mm_routing_spans`. Its `token_ids` are
+/// `form`, and it has no `session_id`, which describes the event.
 fn rest_of(stored: &pb::BlockStored, at: usize, form: &Ids) -> pb::BlockStored {
     pb::BlockStored {
         block_hashes: Vec::new(),
         parent_block_hash: None,
-        token_ids: Some(pb::BlockTokenIds {
-            ids: Some(form.clone()),
-        }),
+        token_ids: Some(form.clone()),
         block_size: stored.block_size,
         lora_id: stored.lora_id,
         medium: stored.medium.clone(),
-        lora_name: stored.lora_name.clone(),
-        session_id: None,
         cache_salt: stored.cache_salt.clone(),
+        session_id: None,
+        lora_name: stored.lora_name.clone(),
         mm_routing_spans: stored
             .mm_routing_spans
             .get(at)
             .cloned()
             .into_iter()
             .collect(),
-        extra_keys: stored.extra_keys.get(at).cloned().into_iter().collect(),
-        group_idx: stored.group_idx,
-        kv_cache_spec_kind: stored.kv_cache_spec_kind.clone(),
-        kv_cache_spec_sliding_window: stored.kv_cache_spec_sliding_window,
-        locality: stored.locality.clone(),
-        ownership: stored.ownership.clone(),
-        lookahead_token_ids: Vec::new(),
-        reuse_report: false,
     }
 }
 
 /// Each [`rest_of`] a held block has, kept once however many blocks have the same: most
-/// blocks of a cache do, unless their `extra_keys` differ, as those of multimodal blocks do.
+/// blocks of a cache do, unless their `mm_routing_spans` differ.
 #[derive(Default)]
 struct Rests {
     by_encoding: FxHashMap<Vec<u8>, Arc<pb::BlockStored>>,
@@ -296,64 +225,48 @@ impl Rests {
 }
 
 /// The ledger's blocks as stores, each after the store that holds its parent.
-fn stores(ledger: Ledger<Held>) -> impl Iterator<Item = pb::BlockStored> + Send {
-    ledger.chains().into_iter().flat_map(move |chain| {
-        let parent = chain.parent.and_then(|parent| ledger.get(parent));
-        chain_stores(parent.map(|held| held.block.hash.clone()), &chain.blocks)
-    })
+fn stores(ledger: Ledger<Arc<StoredBlock>>) -> impl Iterator<Item = pb::BlockStored> + Send {
+    let chains = ledger.chains().into_iter();
+    chains.flat_map(|chain| chain_stores(chain.parent.map(u64::cast_signed), &chain.blocks))
 }
 
-/// One chain as stores: consecutive blocks with the same [`rest_of`] share a store, and each
-/// further copy of a block is a store of its own, after the chain's.
-fn chain_stores(mut parent: Option<pb::BlockHash>, blocks: &[(u64, Held)]) -> Vec<pb::BlockStored> {
+/// One chain as stores: consecutive blocks with the same [`rest_of`] share a store.
+fn chain_stores(
+    mut parent: Option<i64>,
+    blocks: &[(u64, Arc<StoredBlock>)],
+) -> Vec<pb::BlockStored> {
     let mut stores: Vec<pb::BlockStored> = Vec::new();
-    let mut copies = Vec::new();
     let mut last: Option<&StoredBlock> = None;
-    for (_, held) in blocks {
-        let block = &*held.block;
-        // A store has lookahead tokens for all of its blocks or for none.
-        let joins = last.is_some_and(|last| {
-            Arc::ptr_eq(&last.rest, &block.rest)
-                && last.lookahead_token_ids.is_some() == block.lookahead_token_ids.is_some()
-        });
+    for (_, block) in blocks {
+        let joins = last.is_some_and(|last| Arc::ptr_eq(&last.rest, &block.rest));
         let fits = |store: &pb::BlockStored| {
             let blocks = store.block_hashes.len();
             blocks < STORE_BLOCKS && (blocks + 1) * store.block_size as usize <= STORE_TOKEN_IDS
         };
         match stores.last_mut() {
             Some(store) if joins && fits(store) => append(store, block),
-            _ => stores.push(store_of(parent.clone(), block)),
+            _ => {
+                // The block's own spans are in its `rest`: `append` puts them back.
+                let mut store = pb::BlockStored {
+                    parent_block_hash: parent,
+                    mm_routing_spans: Vec::new(),
+                    ..(*block.rest).clone()
+                };
+                append(&mut store, block);
+                stores.push(store);
+            }
         }
-        copies.extend((1..held.copies).map(|_| store_of(parent.clone(), block)));
-        parent = Some(block.hash.clone());
+        parent = Some(block.hash);
         last = Some(block);
     }
-    stores.extend(copies);
     stores
-}
-
-/// A store of `block` alone. Its `rest` holds the block's own entries of the per-block
-/// lists, which `append` puts back.
-fn store_of(parent: Option<pb::BlockHash>, block: &StoredBlock) -> pb::BlockStored {
-    let mut store = pb::BlockStored {
-        parent_block_hash: parent,
-        mm_routing_spans: Vec::new(),
-        extra_keys: Vec::new(),
-        ..(*block.rest).clone()
-    };
-    append(&mut store, block);
-    store
 }
 
 /// Adds `block` to the end of a store whose blocks have its `rest`.
 fn append(store: &mut pb::BlockStored, block: &StoredBlock) {
-    store.block_hashes.push(block.hash.clone());
+    store.block_hashes.push(block.hash);
     let ids = block.token_ids.to_vec();
-    match store
-        .token_ids
-        .as_mut()
-        .and_then(|token_ids| token_ids.ids.as_mut())
-    {
+    match &mut store.token_ids {
         Some(Ids::Single(list)) => list.token_ids.extend(ids),
         Some(Ids::Pairs(list)) => {
             list.pairs
@@ -367,20 +280,11 @@ fn append(store: &mut pb::BlockStored, block: &StoredBlock) {
     store
         .mm_routing_spans
         .extend(block.rest.mm_routing_spans.iter().cloned());
-    store
-        .extra_keys
-        .extend(block.rest.extra_keys.iter().cloned());
-    let lookahead = block.lookahead_token_ids.as_ref();
-    store
-        .lookahead_token_ids
-        .extend(lookahead.map(|token_ids| pb::TokenIdList {
-            token_ids: token_ids.to_vec(),
-        }));
 }
 
 #[cfg(test)]
 mod tests {
-    use std::collections::BTreeSet;
+    use std::collections::{BTreeMap, BTreeSet};
 
     use super::pb::kv_cache_event::Event;
     use super::*;
@@ -395,24 +299,18 @@ mod tests {
             self.0 % bound
         }
 
-        fn one_of(&mut self, of: &[u64]) -> Option<u64> {
+        fn one_of(&mut self, of: &[i64]) -> Option<i64> {
             (!of.is_empty()).then(|| of[self.below(of.len() as u64) as usize])
         }
     }
 
-    fn hash(value: u64) -> pb::BlockHash {
-        pb::BlockHash {
-            value: Some(pb::block_hash::Value::UnsignedValue(value)),
-        }
-    }
-
     /// A store of one to three new blocks after `parent`, with or without each optional part.
-    fn new_store(rng: &mut Seeded, last_hash: &mut u64, parent: Option<u64>) -> pb::BlockStored {
+    fn new_store(rng: &mut Seeded, last_hash: &mut i64, parent: Option<i64>) -> pb::BlockStored {
         let blocks = 1 + rng.below(3) as usize;
         let size = 1 + rng.below(2) as usize;
         // Some need more than 32 bits.
         let id = |rng: &mut Seeded| rng.below(3) << (30 * rng.below(2));
-        let ids = if rng.below(8) == 0 {
+        let token_ids = if rng.below(8) == 0 {
             let pair = |_| pb::TokenIdPair {
                 first: id(rng),
                 second: id(rng),
@@ -425,37 +323,29 @@ mod tests {
                 token_ids: (0..blocks * size).map(|_| id(rng)).collect(),
             })
         };
-        let (keys, lookahead) = (rng.below(3) == 0, rng.below(4) == 0);
+        let labeled = rng.below(3) == 0;
         let block_hashes = (0..blocks).map(|_| {
             *last_hash += 1;
-            hash(*last_hash)
+            *last_hash
         });
         pb::BlockStored {
             block_hashes: block_hashes.collect(),
-            parent_block_hash: parent.map(hash),
-            token_ids: Some(pb::BlockTokenIds { ids: Some(ids) }),
+            parent_block_hash: parent,
+            token_ids: Some(token_ids),
             block_size: size as u32,
             medium: Some(DEVICE_MEDIUM.to_string()),
             lora_name: (rng.below(3) == 0).then(|| "adapter".to_string()),
-            extra_keys: (0..blocks)
-                .filter(|_| keys)
-                .map(|_| extra_key(rng.below(2)))
-                .collect(),
-            lookahead_token_ids: (0..blocks)
-                .filter(|_| lookahead)
-                .map(|_| pb::TokenIdList {
-                    token_ids: vec![rng.below(9)],
+            mm_routing_spans: (0..blocks)
+                .filter(|_| labeled)
+                .map(|_| pb::BlockMmRoutingSpans {
+                    spans: vec![pb::MmRoutingSpan {
+                        start: 0,
+                        length: rng.below(2),
+                        label: "image".to_string(),
+                    }],
                 })
                 .collect(),
             ..Default::default()
-        }
-    }
-
-    fn extra_key(value: u64) -> pb::BlockExtraKeys {
-        pb::BlockExtraKeys {
-            keys: vec![pb::ExtraKeyValue {
-                value: Some(pb::extra_key_value::Value::Integer(value as i64)),
-            }],
         }
     }
 
@@ -463,15 +353,9 @@ mod tests {
     /// session.
     fn per_block(store: &pb::BlockStored) -> Vec<pb::BlockStored> {
         let size = store.block_size as usize;
-        let mut parent = store.parent_block_hash.clone();
-        let rest = pb::BlockStored {
-            block_hashes: Vec::new(),
-            token_ids: None,
-            session_id: None,
-            ..store.clone()
-        };
-        let blocks = store.block_hashes.iter().enumerate().map(|(at, hash)| {
-            let ids = match store.token_ids.as_ref().and_then(|ids| ids.ids.as_ref()) {
+        let mut parent = store.parent_block_hash;
+        let blocks = store.block_hashes.iter().enumerate().map(|(at, &hash)| {
+            let token_ids = match &store.token_ids {
                 Some(Ids::Single(list)) => Ids::Single(pb::TokenIdList {
                     token_ids: list.token_ids[at * size..][..size].to_vec(),
                 }),
@@ -481,13 +365,12 @@ mod tests {
                 None => panic!("a store without token ids: {store:?}"),
             };
             pb::BlockStored {
-                block_hashes: vec![hash.clone()],
-                parent_block_hash: parent.replace(hash.clone()),
-                token_ids: Some(pb::BlockTokenIds { ids: Some(ids) }),
-                extra_keys: store.extra_keys.get(at).cloned().into_iter().collect(),
-                lookahead_token_ids: (store.lookahead_token_ids.get(at).cloned().into_iter())
-                    .collect(),
-                ..rest.clone()
+                block_hashes: vec![hash],
+                parent_block_hash: parent.replace(hash),
+                token_ids: Some(token_ids),
+                session_id: None,
+                mm_routing_spans: (store.mm_routing_spans.get(at).cloned().into_iter()).collect(),
+                ..store.clone()
             }
         });
         blocks.collect()
@@ -514,17 +397,17 @@ mod tests {
         stores
     }
 
-    /// What a snapshot of `blocks` says, as one store per block and copy, by hash. Checks
-    /// that each block follows its parent.
+    /// What a snapshot of `blocks` says, as one store per block, by hash. Checks that each
+    /// block follows its parent.
     fn snapshot(blocks: &Blocks) -> Vec<pb::BlockStored> {
         let mut said: Vec<_> = snapshot_stores(blocks).iter().flat_map(per_block).collect();
         for (at, block) in said.iter().enumerate() {
-            let parent = block.parent_block_hash.as_ref();
+            let parent = block.parent_block_hash;
             assert!(
-                parent.is_none_or(|parent| said[..at].iter().any(|b| &b.block_hashes[0] == parent))
+                parent.is_none_or(|parent| said[..at].iter().any(|b| b.block_hashes[0] == parent))
             );
         }
-        said.sort_by_key(|block| hash_key(&block.block_hashes[0]));
+        said.sort_by_key(|block| block.block_hashes[0]);
         said
     }
 
@@ -547,18 +430,19 @@ mod tests {
     #[test]
     fn a_snapshot_then_the_later_batches_equals_every_batch() {
         let mut rng = Seeded(0x9E37_79B9_7F4A_7C15);
-        // Each held block as one store, with how many copies are held.
-        let mut held: BTreeMap<u64, (pb::BlockStored, u32)> = BTreeMap::new();
+        // Each held block as one store.
+        let mut held: BTreeMap<i64, pb::BlockStored> = BTreeMap::new();
         let mut blocks = Blocks::default();
         let mut from_snapshot: Option<Blocks> = None;
-        let mut last_hash = 0;
+        // Hashes are signed.
+        let mut last_hash = -5;
 
         for sequence_number in 0..2000 {
-            let hashes: Vec<u64> = held.keys().copied().collect();
-            let parents: BTreeSet<u64> = (held.values())
-                .filter_map(|(block, _)| block.parent_block_hash.as_ref().map(hash_key))
+            let hashes: Vec<i64> = held.keys().copied().collect();
+            let parents: BTreeSet<i64> = (held.values())
+                .filter_map(|block| block.parent_block_hash)
                 .collect();
-            let leaves: Vec<u64> = hashes
+            let leaves: Vec<i64> = hashes
                 .iter()
                 .copied()
                 .filter(|hash| !parents.contains(hash))
@@ -570,21 +454,24 @@ mod tests {
                 held.clear();
                 Event::AllBlocksCleared(pb::AllBlocksCleared {})
             } else if let Some(leaf) = leaf {
-                let copies = &mut held.get_mut(&leaf).expect("a held block").1;
-                *copies -= 1;
-                if *copies == 0 {
+                // A remove on another tier leaves the device's block.
+                let medium = if roll == 6 {
+                    "CPU_PINNED"
+                } else {
+                    DEVICE_MEDIUM
+                };
+                if medium == DEVICE_MEDIUM {
                     held.remove(&leaf);
                 }
                 Event::BlockRemoved(pb::BlockRemoved {
-                    block_hashes: vec![hash(leaf)],
-                    medium: Some(DEVICE_MEDIUM.to_string()),
-                    ..Default::default()
+                    block_hashes: vec![leaf],
+                    medium: Some(medium.to_string()),
                 })
             } else {
                 // A held block again, or new blocks after a held block or none.
                 let again = rng.one_of(&hashes).filter(|_| roll == 7);
                 let mut store = match again {
-                    Some(again) => held[&again].0.clone(),
+                    Some(again) => held[&again].clone(),
                     None => {
                         let parent = rng.one_of(&hashes).filter(|_| rng.below(4) != 0);
                         new_store(&mut rng, &mut last_hash, parent)
@@ -592,18 +479,14 @@ mod tests {
                 };
                 store.session_id = Some("session".to_string());
                 match roll {
-                    8 => store.medium = Some("CPU".to_string()),
-                    9 => store.reuse_report = true,
+                    8 => store.medium = Some("CPU_PINNED".to_string()),
                     // Its tokens no longer divide among its blocks.
-                    10 => store.block_size += 1,
-                    _ if again.is_none() || COUNTS_COPIES => {
+                    9 => store.block_size += 1,
+                    _ => {
                         for block in per_block(&store) {
-                            held.entry(hash_key(&block.block_hashes[0]))
-                                .or_insert((block, 0))
-                                .1 += 1;
+                            held.entry(block.block_hashes[0]).or_insert(block);
                         }
                     }
-                    _ => {}
                 }
                 Event::BlockStored(store)
             };
@@ -615,12 +498,10 @@ mod tests {
                 .for_each(|blocks| blocks.apply(&batch));
 
             if sequence_number % 100 == 99 {
-                let expected = held.values().flat_map(|(block, copies)| {
-                    std::iter::repeat_n(block.clone(), *copies as usize)
-                });
-                assert_eq!(snapshot(&blocks), expected.collect::<Vec<_>>());
+                let expected: Vec<_> = held.values().cloned().collect();
+                assert_eq!(snapshot(&blocks), expected);
                 if let Some(from_snapshot) = &from_snapshot {
-                    assert_eq!(snapshot(from_snapshot), snapshot(&blocks));
+                    assert_eq!(snapshot(from_snapshot), expected);
                 }
 
                 let stores = snapshot_stores(&blocks).into_iter().map(Event::BlockStored);
@@ -641,10 +522,8 @@ mod tests {
                 token_ids: vec![u64::MAX; chain * size],
             };
             let store = pb::BlockStored {
-                block_hashes: (1..=chain as u64).map(hash).collect(),
-                token_ids: Some(pb::BlockTokenIds {
-                    ids: Some(Ids::Single(ids)),
-                }),
+                block_hashes: (1..=chain as i64).collect(),
+                token_ids: Some(Ids::Single(ids)),
                 block_size: size as u32,
                 medium: Some(DEVICE_MEDIUM.to_string()),
                 ..Default::default()
@@ -656,30 +535,30 @@ mod tests {
     }
 
     /// After a loss, the live stream can restart before a batch that a replay delivered:
-    /// that batch is not applied twice and the cursor does not move back.
+    /// that batch is not applied again and the cursor does not move back.
     #[test]
     fn a_batch_delivered_again_after_a_loss_is_not_applied_again() {
         let mut blocks = Blocks::default();
         let stored = new_store(&mut Seeded(1), &mut 0, None);
-        let batch = batch(0, [Event::BlockStored(stored)]);
-        blocks.apply(&batch);
-        let once = snapshot(&blocks);
+        let removed = pb::BlockRemoved {
+            block_hashes: stored.block_hashes.clone(),
+            medium: stored.medium.clone(),
+        };
+        let store = batch(0, [Event::BlockStored(stored)]);
+        blocks.apply(&store);
+        blocks.apply(&batch(1, [Event::BlockRemoved(removed)]));
 
         blocks.lost(0);
-        blocks.apply(&batch);
-        assert_eq!(snapshot(&blocks), once);
-        let end = blocks
-            .snapshot(String::new())
-            .last()
-            .and_then(|response| response.item);
-        let resume = pb::KvEventCursor {
-            stream_id: String::new(),
-            next_sequence_number: 1,
+        blocks.apply(&store);
+        let end = pb::KvSnapshotEnd {
+            resume: Some(pb::KvEventCursor {
+                stream_id: String::new(),
+                next_sequence_number: 2,
+            }),
+            complete: false,
         };
-        let end = match end {
-            Some(pb::get_kv_snapshot_response::Item::End(end)) => end,
-            other => panic!("a snapshot ends with `end`, got {other:?}"),
-        };
-        assert_eq!((end.resume, end.complete), (Some(resume), false));
+        let end = pb::get_kv_snapshot_response::Item::End(end);
+        let snapshot: Vec<_> = blocks.snapshot(String::new()).collect();
+        assert_eq!(snapshot, [pb::GetKvSnapshotResponse { item: Some(end) }]);
     }
 }
